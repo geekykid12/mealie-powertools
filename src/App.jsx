@@ -1,7 +1,7 @@
 import { useState, useEffect, useCallback, useRef } from "react";
 
 // ─── Version ─────────────────────────────────────────────────────────────────
-const VERSION = "1.0.0";
+const VERSION = "0.1.0";
 
 // ─── Design tokens ───────────────────────────────────────────────────────────
 const C = {
@@ -908,7 +908,11 @@ function ParserSection({ api, addLog }) {
       ...ing, ...(parsed[idx] ? {
         food: parsed[idx].ingredient?.food,
         unit: parsed[idx].ingredient?.unit,
-        quantity: parsed[idx].ingredient?.quantity,
+        // Only accept quantity if original had one, or if display text contains a number
+        // Prevents parser from inventing quantities like "2 tsp" for "some marjoram"
+        quantity: (ing.quantity || /\d/.test(ing.display || ing.note || ""))
+          ? parsed[idx].ingredient?.quantity
+          : null,
       } : {}),
     }));
 
@@ -969,6 +973,8 @@ function ParserSection({ api, addLog }) {
                   original: { display: ing.display || ing.note || "", food: ing.food?.name, unit: ing.unit?.name, qty: ing.quantity },
                   parsed: p ? { food: p.food?.name, unit: p.unit?.name, qty: p.quantity } : null,
                   changed,
+                  // Don't auto-approve if parser invented a quantity with no numeric text in original
+                  quantityAssumed: !ing.quantity && p?.quantity && !/\d/.test(ing.display || ing.note || ""),
                   approved: changed, // default approve changed ones
                   parsedRaw: parsed[idx],
                   ingRaw: ing,
@@ -1597,10 +1603,10 @@ function HouseholdsSection({ api, addLog, cache, onCache }) {
 
 
 // ─── SECTION: Cookbooks ───────────────────────────────────────────────────────
-function CookbooksSection({ api, addLog }) {
-  const [cookbooks, setCookbooks] = useState(null);
-  const [allRecipes, setAllRecipes] = useState([]);
-  const [loading, setLoading] = useState(true);
+function CookbooksSection({ api, addLog, cache, onCache, aiConfig }) {
+  const [cookbooks, setCookbooks] = useState(cache?.cookbooks || null);
+  const [allRecipes, setAllRecipes] = useState(cache?.allRecipes || []);
+  const [loading, setLoading] = useState(!cache);
   const [selected, setSelected] = useState(null);
   const [cbRecipes, setCbRecipes] = useState([]);
   const [creating, setCreating] = useState(false);
@@ -1615,8 +1621,8 @@ function CookbooksSection({ api, addLog }) {
   const [aiError, setAiError] = useState("");
   const [aiModel, setAiModel] = useState("");
   // AI provider info from Mealie
-  const [aiEnabled, setAiEnabled] = useState(false);
-  const [aiProviderName, setAiProviderName] = useState("");
+  const [aiEnabled, setAiEnabled] = useState(cache?.aiEnabled || false);
+  const [aiProviderName, setAiProviderName] = useState(cache?.aiProviderName || "");
   const [aiApiKey, setAiApiKey] = useState(() => {
     try { return localStorage.getItem(LS_AI_KEY) || ""; } catch { return ""; }
   });
@@ -1710,9 +1716,9 @@ function CookbooksSection({ api, addLog }) {
           recipes: allRecipes,
           cookbooks: cookbooks || [],
           prompt: aiPrompt,
-          aiApiKey,
-          aiBaseUrl,
-          aiModel: aiModelInput,
+          aiApiKey: aiConfig?.apiKey || "",
+          aiBaseUrl: aiConfig?.baseUrl || "",
+          aiModel: aiConfig?.model || "",
         }),
       });
       const data = await res.json();
@@ -1878,20 +1884,25 @@ function CookbooksSection({ api, addLog }) {
   // ── Main view ─────────────────────────────────────────────────────────────────
   return (
     <div style={{ display: "flex", flexDirection: "column", gap: 20 }}>
+      <CacheHeader loadedAt={cache?.loadedAt} loading={loading} label="Cookbooks" onReload={() => { onCache(null); load(); }} />
       <div style={{ display: "flex", gap: 20 }}>
         {/* Sidebar */}
         <div style={{ width: 300, flexShrink: 0, display: "flex", flexDirection: "column", gap: 12 }}>
           <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
             <div style={{ fontWeight: 600 }}>Cookbooks ({cookbooks?.length ?? 0})</div>
             <div style={{ display: "flex", gap: 6 }}>
-              {aiEnabled && (
+              {aiConfig?.enabled && aiConfig?.apiKey && (
                 <button className="btn-ghost" style={{ padding: "5px 10px", fontSize: 12, color: "#a855f7", borderColor: "#a855f744" }}
-                  title={`Generate AI cookbook recommendations using ${aiProviderName}`}
-                  onClick={() => {
-                    if (!aiConfigured) { setShowAiConfig(true); }
-                    else { setAiOpen(true); setAiResults(null); setAiError(""); }
-                  }}>
+                  title={`Generate AI cookbook recommendations using ${aiConfig.providerName || "AI"}`}
+                  onClick={() => { setAiOpen(true); setAiResults(null); setAiError(""); }}>
                   ✨ AI
+                </button>
+              )}
+              {aiConfig?.enabled && !aiConfig?.apiKey && (
+                <button className="btn-ghost" style={{ padding: "5px 10px", fontSize: 12, color: C.yellow, borderColor: C.yellow + "44" }}
+                  title="Set your AI API key in Admin → AI"
+                  onClick={() => addLog("warn", "Set your AI API key in Admin → ✨ AI tab")}>
+                  ✨ AI (key needed)
                 </button>
               )}
               <button className="btn-primary" style={{ padding: "5px 10px", fontSize: 12 }}
@@ -1987,19 +1998,13 @@ function CookbooksSection({ api, addLog }) {
               <div>
                 <div style={{ fontWeight: 700, fontSize: 16 }}>✨ AI Cookbook Recommendations</div>
                 <div style={{ fontSize: 12, color: C.muted, marginTop: 3 }}>
-                  {aiProviderName} · {aiModelInput} · {allRecipes.length} recipes
+                  {aiConfig?.providerName || "AI"} · {aiConfig?.model || ""} · {allRecipes.length} recipes
                 </div>
               </div>
-              <div style={{ display: "flex", gap: 6 }}>
-                <button className="btn-ghost" style={{ padding: "4px 10px", fontSize: 11 }}
-                  onClick={() => { setAiOpen(false); setShowAiConfig(true); }}>
-                  ⚙ Config
-                </button>
-                <button className="btn-ghost" style={{ padding: "4px 8px" }}
-                  onClick={() => { setAiOpen(false); setAiResults(null); setAiError(""); }}>
-                  <Icon name="close" size={14} />
-                </button>
-              </div>
+              <button className="btn-ghost" style={{ padding: "4px 8px" }}
+                onClick={() => { setAiOpen(false); setAiResults(null); setAiError(""); }}>
+                <Icon name="close" size={14} />
+              </button>
             </div>
 
             <div style={{ flexShrink: 0, marginBottom: 16 }}>
@@ -2079,55 +2084,6 @@ function CookbooksSection({ api, addLog }) {
                 Mealie's AI will analyze your recipe names, categories, and tags to suggest meaningful cookbook groupings.
               </div>
             )}
-          </div>
-        </div>
-      )}
-
-      {/* AI Config Modal */}
-      {showAiConfig && (
-        <div style={{ position: "fixed", inset: 0, background: "#000b", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 100 }}>
-          <div className="card fade-up" style={{ width: 480 }}>
-            <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 4 }}>
-              <div style={{ fontWeight: 700, fontSize: 16 }}>✨ AI Configuration</div>
-              <button className="btn-ghost" style={{ padding: "4px 8px" }} onClick={() => setShowAiConfig(false)}>
-                <Icon name="close" size={14} />
-              </button>
-            </div>
-            <div style={{ fontSize: 12, color: C.muted, marginBottom: 16, lineHeight: 1.6 }}>
-              PowerTools detected your Mealie AI provider. The API key is not exposed by Mealie's API for security — enter it once below. It's stored in your browser session only.
-            </div>
-
-            {/* Pre-filled provider info */}
-            <div style={{ background: C.surfaceAlt, borderRadius: 8, padding: "12px 14px", marginBottom: 16, display: "flex", flexDirection: "column", gap: 8 }}>
-              {[
-                ["Provider", aiProviderName],
-                ["Base URL", aiBaseUrl || "https://api.openai.com/v1"],
-                ["Model", aiModelInput],
-              ].map(([k, v]) => (
-                <div key={k} style={{ display: "flex", gap: 12, fontSize: 12 }}>
-                  <span style={{ color: C.muted, minWidth: 70 }}>{k}</span>
-                  <span className="mono" style={{ color: C.text }}>{v}</span>
-                </div>
-              ))}
-            </div>
-
-            <div style={{ display: "flex", flexDirection: "column", gap: 14 }}>
-              <div>
-                <label style={{ fontSize: 11, color: C.muted, display: "block", marginBottom: 5, textTransform: "uppercase", letterSpacing: ".06em" }}>API Key</label>
-                <input type="password" value={aiApiKey} onChange={e => setAiApiKey(e.target.value)}
-                  placeholder="Your API key for this provider" autoFocus />
-              </div>
-              <div style={{ display: "flex", gap: 10, justifyContent: "flex-end", marginTop: 4 }}>
-                <button className="btn-ghost" onClick={() => setShowAiConfig(false)}>Cancel</button>
-                <button className="btn-primary" disabled={!aiApiKey}
-                  onClick={() => {
-                    try { localStorage.setItem(LS_AI_KEY, aiApiKey); } catch {}
-                    setAiConfigured(true); setShowAiConfig(false); setAiOpen(true); setAiResults(null); setAiError("");
-                  }}>
-                  Save & Generate →
-                </button>
-              </div>
-            </div>
           </div>
         </div>
       )}
@@ -2273,6 +2229,19 @@ export default function App() {
   const [qualityResults, setQualityResults] = useState(null);
   const [recipeCache, setRecipeCache] = useState(null);
   const [householdCache, setHouseholdCache] = useState(null);
+  const [taxonomyCache, setTaxonomyCache] = useState(null);
+  const [cookbooksCache, setCookbooksCache] = useState(null);
+  // Global AI config — set in Admin, read by Cookbooks and Tags & Cats
+  const [aiConfig, setAiConfig] = useState(() => {
+    try {
+      const saved = localStorage.getItem("mpt_ai_config");
+      return saved ? JSON.parse(saved) : { apiKey: "", baseUrl: "", model: "", enabled: false, providerName: "" };
+    } catch { return { apiKey: "", baseUrl: "", model: "", enabled: false, providerName: "" }; }
+  });
+  const saveAiConfig = (cfg) => {
+    setAiConfig(cfg);
+    try { localStorage.setItem("mpt_ai_config", JSON.stringify(cfg)); } catch {}
+  };
 
   const addLog = useCallback((type, msg) => {
     const ts = new Date().toLocaleTimeString();
@@ -2433,13 +2402,13 @@ export default function App() {
             {tab === "recipes"    && <RecipesSection    api={conn.api} addLog={addLog} cache={recipeCache} onCache={setRecipeCache} />}
             {tab === "parser"     && <ParserSection     api={conn.api} addLog={addLog} />}
             {tab === "bulk"       && <BulkSection       api={conn.api} addLog={addLog} />}
-            {tab === "taxonomy"   && <TaxonomySection   api={conn.api} addLog={addLog} />}
-            {tab === "cookbooks"  && <CookbooksSection  api={conn.api} addLog={addLog} />}
+            {tab === "taxonomy"   && <TaxonomySection   api={conn.api} addLog={addLog} cache={taxonomyCache} onCache={setTaxonomyCache} aiConfig={aiConfig} />}
+            {tab === "cookbooks"  && <CookbooksSection  api={conn.api} addLog={addLog} cache={cookbooksCache} onCache={setCookbooksCache} aiConfig={aiConfig} />}
             {tab === "quality"    && <DataQualitySection api={conn.api} addLog={addLog} savedResults={qualityResults} onSaveResults={setQualityResults} />}
             {tab === "images"     && <ImageSection      api={conn.api} addLog={addLog} />}
             {tab === "activity"   && <ActivitySection   api={conn.api} addLog={addLog} />}
             {tab === "households" && <HouseholdsSection api={conn.api} addLog={addLog} cache={householdCache} onCache={setHouseholdCache} />}
-            {tab === "admin"      && <AdminSection      api={conn.api} addLog={addLog} />}
+            {tab === "admin"      && <AdminSection      api={conn.api} addLog={addLog} aiConfig={aiConfig} onSaveAiConfig={saveAiConfig} />}
           </div>
 
           {/* Global log footer */}
@@ -2621,30 +2590,24 @@ function BulkSection({ api, addLog }) {
 }
 
 // ─── SECTION: Tags & Categories ───────────────────────────────────────────────
-function TaxonomySection({ api, addLog }) {
-  const [activeType, setActiveType] = useState("tags");
-  const [items, setItems] = useState([]);
-  const [allRecipes, setAllRecipes] = useState([]);
-  const [recipeCounts, setRecipeCounts] = useState({});
-  const [loading, setLoading] = useState(true);
+function TaxonomySection({ api, addLog, cache, onCache, aiConfig }) {
+  const [activeType, setActiveType] = useState(cache?.activeType || "tags");
+  const [items, setItems] = useState(cache?.items || []);
+  const [allRecipes, setAllRecipes] = useState(cache?.allRecipes || []);
+  const [recipeCounts, setRecipeCounts] = useState(cache?.recipeCounts || {});
+  const [loading, setLoading] = useState(!cache);
   const [newName, setNewName] = useState("");
   const [editItem, setEditItem] = useState(null);
   const [editName, setEditName] = useState("");
   const [saving, setSaving] = useState(false);
 
-  // AI state
-  const [aiEnabled, setAiEnabled] = useState(false);
+  // AI state — credentials come from global aiConfig (set in Admin → AI)
   const [aiOpen, setAiOpen] = useState(false);
   const [aiPrompt, setAiPrompt] = useState("");
   const [aiLoading, setAiLoading] = useState(false);
   const [aiResults, setAiResults] = useState(null);
   const [aiError, setAiError] = useState("");
   const [aiModel, setAiModel] = useState("");
-  const [aiApiKey, setAiApiKey] = useState(() => { try { return localStorage.getItem(LS_AI_KEY) || ""; } catch { return ""; } });
-  const [aiBaseUrl, setAiBaseUrl] = useState("");
-  const [aiModelInput, setAiModelInput] = useState("");
-  const [showAiConfig, setShowAiConfig] = useState(false);
-  const [aiConfigured, setAiConfigured] = useState(() => { try { return !!localStorage.getItem(LS_AI_KEY); } catch { return false; } });
   // which suggestions are selected for creation
   const [selected, setSelected] = useState(new Set());
   const [creating, setCreating] = useState(false);
@@ -2668,6 +2631,7 @@ function TaxonomySection({ api, addLog }) {
       setRecipeCounts(counts);
 
       // Load all recipes for AI context (only if not already loaded)
+      let recipesForAi = allRecipes;
       if (allRecipes.length === 0) {
         let all = [], page = 1;
         while (true) {
@@ -2677,21 +2641,10 @@ function TaxonomySection({ api, addLog }) {
           page++;
         }
         setAllRecipes(all);
+        recipesForAi = all;
       }
 
-      // Check AI config
-      try {
-        const aiInfo = await fetch("/ai-info", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ mealieUrl: api._base, token: api._token }),
-        }).then(r => r.json());
-        if (aiInfo.aiEnabled) {
-          setAiEnabled(true);
-          setAiBaseUrl(aiInfo.baseUrl || "");
-          setAiModelInput(aiInfo.model || "");
-        }
-      } catch { setAiEnabled(false); }
+      onCache({ items: list, recipeCounts: counts, allRecipes: recipesForAi, activeType, loadedAt: Date.now() });
     } catch (e) { addLog("error", e.message); }
     setLoading(false);
   }, [api, activeType]);
@@ -2752,9 +2705,9 @@ function TaxonomySection({ api, addLog }) {
           existingItems: items,
           type: activeType,
           prompt: aiPrompt,
-          aiApiKey,
-          aiBaseUrl,
-          aiModel: aiModelInput,
+          aiApiKey: aiConfig?.apiKey || "",
+          aiBaseUrl: aiConfig?.baseUrl || "",
+          aiModel: aiConfig?.model || "",
         }),
       });
       const data = await res.json();
@@ -2790,6 +2743,7 @@ function TaxonomySection({ api, addLog }) {
 
   return (
     <div style={{ display: "flex", flexDirection: "column", gap: 20 }}>
+      <CacheHeader loadedAt={cache?.loadedAt} loading={loading} label="Tags & Categories" onReload={() => { onCache(null); load(); }} />
       {/* Type switcher */}
       <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
         {["tags", "categories"].map(type => (
@@ -2819,14 +2773,18 @@ function TaxonomySection({ api, addLog }) {
         <button className="btn-primary" onClick={create} disabled={saving || !newName.trim()}>
           {saving ? <Spinner size={13} /> : "+ Create"}
         </button>
-        {aiEnabled && (
+        {aiConfig?.enabled && aiConfig?.apiKey && (
           <button className="btn-ghost" style={{ padding: "8px 14px", color: "#a855f7", borderColor: "#a855f744", whiteSpace: "nowrap" }}
             title={`Generate ${activeType} suggestions using AI`}
-            onClick={() => {
-              if (!aiConfigured) { setShowAiConfig(true); }
-              else { setAiOpen(true); setAiResults(null); setAiError(""); }
-            }}>
+            onClick={() => { setAiOpen(true); setAiResults(null); setAiError(""); }}>
             ✨ AI Suggest
+          </button>
+        )}
+        {aiConfig?.enabled && !aiConfig?.apiKey && (
+          <button className="btn-ghost" style={{ padding: "8px 14px", color: C.yellow, borderColor: C.yellow + "44", whiteSpace: "nowrap" }}
+            title="Set your AI API key in Admin → AI"
+            onClick={() => addLog("warn", "Set your AI API key in Admin → ✨ AI tab")}>
+            ✨ AI (key needed)
           </button>
         )}
         {unused.length > 0 && (
@@ -2888,43 +2846,6 @@ function TaxonomySection({ api, addLog }) {
         </div>
       )}
 
-      {/* AI Config Modal */}
-      {showAiConfig && (
-        <div style={{ position: "fixed", inset: 0, background: "#000b", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 100 }}>
-          <div className="card fade-up" style={{ width: 460 }}>
-            <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 4 }}>
-              <div style={{ fontWeight: 700, fontSize: 16 }}>✨ AI Configuration</div>
-              <button className="btn-ghost" style={{ padding: "4px 8px" }} onClick={() => setShowAiConfig(false)}>
-                <Icon name="close" size={14} />
-              </button>
-            </div>
-            <div style={{ fontSize: 12, color: C.muted, marginBottom: 16, lineHeight: 1.6 }}>
-              Enter your API key for the configured AI provider. Stored in your browser only.
-            </div>
-            <div style={{ background: C.surfaceAlt, borderRadius: 8, padding: "12px 14px", marginBottom: 16 }}>
-              {[["Base URL", aiBaseUrl || "https://api.openai.com/v1"], ["Model", aiModelInput]].map(([k, v]) => (
-                <div key={k} style={{ display: "flex", gap: 12, fontSize: 12, marginBottom: 4 }}>
-                  <span style={{ color: C.muted, minWidth: 70 }}>{k}</span>
-                  <span className="mono">{v}</span>
-                </div>
-              ))}
-            </div>
-            <input type="password" value={aiApiKey} onChange={e => setAiApiKey(e.target.value)}
-              placeholder="Your API key…" autoFocus style={{ marginBottom: 14 }} />
-            <div style={{ display: "flex", gap: 10, justifyContent: "flex-end" }}>
-              <button className="btn-ghost" onClick={() => setShowAiConfig(false)}>Cancel</button>
-              <button className="btn-primary" disabled={!aiApiKey}
-                onClick={() => {
-                  try { localStorage.setItem(LS_AI_KEY, aiApiKey); } catch {}
-                  setAiConfigured(true); setShowAiConfig(false); setAiOpen(true); setAiResults(null); setAiError("");
-                }}>
-                Save & Generate →
-              </button>
-            </div>
-          </div>
-        </div>
-      )}
-
       {/* AI Suggest Modal */}
       {aiOpen && (
         <div style={{ position: "fixed", inset: 0, background: "#000c", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 100, padding: 20 }}>
@@ -2933,7 +2854,7 @@ function TaxonomySection({ api, addLog }) {
               <div>
                 <div style={{ fontWeight: 700, fontSize: 16 }}>✨ AI {activeType === "categories" ? "Category" : "Tag"} Suggestions</div>
                 <div style={{ fontSize: 12, color: C.muted, marginTop: 3 }}>
-                  {aiModelInput} · {allRecipes.length} recipes · {items.length} existing {activeType}
+                  {aiConfig?.providerName || "AI"} · {aiConfig?.model || ""} · {allRecipes.length} recipes
                 </div>
               </div>
               <button className="btn-ghost" style={{ padding: "4px 8px" }}
@@ -3315,7 +3236,7 @@ function DataQualitySection({ api, addLog, savedResults, onSaveResults }) {
 
 
 // ─── SECTION: Admin ────────────────────────────────────────────────────────────
-function AdminSection({ api, addLog }) {
+function AdminSection({ api, addLog, aiConfig, onSaveAiConfig }) {
   const [activeTab, setActiveTab] = useState("users");
   const [users, setUsers] = useState([]);
   const [loading, setLoading] = useState(true);
@@ -3323,6 +3244,12 @@ function AdminSection({ api, addLog }) {
   const [newUser, setNewUser] = useState({ username: "", email: "", password: "", fullName: "", admin: false });
   const [creating, setCreating] = useState(false);
   const [saving, setSaving] = useState(false);
+  // AI Settings tab state
+  const [aiProviderInfo, setAiProviderInfo] = useState(null);
+  const [aiInfoLoading, setAiInfoLoading] = useState(false);
+  const [aiKeyInput, setAiKeyInput] = useState(aiConfig?.apiKey || "");
+  const [aiTestResult, setAiTestResult] = useState(null);
+  const [aiTesting, setAiTesting] = useState(false);
 
   useEffect(() => {
     (async () => {
@@ -3383,19 +3310,36 @@ function AdminSection({ api, addLog }) {
     setBackupRunning(false);
   };
 
-  const adminTabs = ["users", "backups"];
+  const adminTabs = ["users", "backups", "ai"];
 
   return (
     <div style={{ display: "flex", flexDirection: "column", gap: 20 }}>
       <div style={{ display: "flex", gap: 8 }}>
         {adminTabs.map(t => (
-          <button key={t} onClick={() => setActiveTab(t)} style={{
+          <button key={t} onClick={async () => {
+            setActiveTab(t);
+            if (t === "ai" && !aiProviderInfo) {
+              setAiInfoLoading(true);
+              try {
+                const info = await fetch("/ai-info", {
+                  method: "POST",
+                  headers: { "Content-Type": "application/json" },
+                  body: JSON.stringify({ mealieUrl: api._base, token: api._token }),
+                }).then(r => r.json());
+                setAiProviderInfo(info);
+                if (info.aiEnabled) {
+                  onSaveAiConfig({ ...aiConfig, baseUrl: info.baseUrl, model: info.model, enabled: true, providerName: info.providerName });
+                }
+              } catch (e) { addLog("error", e.message); }
+              setAiInfoLoading(false);
+            }
+          }} style={{
             padding: "8px 20px", borderRadius: 8, border: `2px solid`,
             borderColor: activeTab === t ? C.accent : C.border,
             background: activeTab === t ? `${C.accent}18` : C.surfaceAlt,
             color: activeTab === t ? C.accent : C.muted,
             fontWeight: 600, fontSize: 13, cursor: "pointer", textTransform: "capitalize",
-          }}>{t}</button>
+          }}>{t === "ai" ? "✨ AI" : t}</button>
         ))}
       </div>
 
@@ -3453,6 +3397,116 @@ function AdminSection({ api, addLog }) {
                   ))}
                 </tbody>
               </table>
+            )}
+          </div>
+        </div>
+      )}
+
+      {/* AI Settings tab */}
+      {activeTab === "ai" && (
+        <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
+          {/* Detected provider info */}
+          <div className="card">
+            <div style={{ fontWeight: 600, marginBottom: 12 }}>Mealie AI Provider</div>
+            {aiInfoLoading ? (
+              <div style={{ padding: 20, textAlign: "center" }}><Spinner size={20} /></div>
+            ) : aiProviderInfo?.aiEnabled ? (
+              <div>
+                <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10, marginBottom: 14 }}>
+                  {[
+                    ["Provider", aiProviderInfo.providerName],
+                    ["Model", aiProviderInfo.model],
+                    ["Base URL", aiProviderInfo.baseUrl],
+                    ["Status", "Configured in Mealie"],
+                  ].map(([k, v]) => (
+                    <div key={k} style={{ background: C.surfaceAlt, borderRadius: 8, padding: "10px 14px" }}>
+                      <div style={{ fontSize: 10, color: C.muted, textTransform: "uppercase", letterSpacing: ".06em", marginBottom: 4 }}>{k}</div>
+                      <div className="mono" style={{ fontSize: 12 }}>{v || "—"}</div>
+                    </div>
+                  ))}
+                </div>
+                <div style={{ fontSize: 12, color: C.muted, background: `${C.blue}10`, border: `1px solid ${C.blue}33`, borderRadius: 8, padding: "10px 14px" }}>
+                  ℹ Mealie's API does not expose the API key for security. Enter it below to enable AI features in PowerTools.
+                </div>
+              </div>
+            ) : (
+              <div style={{ color: C.muted, fontSize: 13 }}>
+                No AI provider detected in Mealie. Configure one in Mealie → Group Settings → AI Providers, then return here.
+              </div>
+            )}
+          </div>
+
+          {/* API Key entry */}
+          <div className="card">
+            <div style={{ fontWeight: 600, marginBottom: 12 }}>PowerTools AI API Key</div>
+            <div style={{ fontSize: 12, color: C.muted, marginBottom: 14, lineHeight: 1.6 }}>
+              Enter the API key for your Mealie AI provider. This is used by PowerTools for AI-powered features (cookbook suggestions, category generation). Stored in your browser only.
+            </div>
+            <div style={{ display: "flex", gap: 10, marginBottom: 12 }}>
+              <input type="password" style={{ flex: 1 }}
+                value={aiKeyInput}
+                onChange={e => setAiKeyInput(e.target.value)}
+                placeholder="API key for your AI provider…" />
+              <button className="btn-primary" style={{ flexShrink: 0 }}
+                disabled={!aiKeyInput}
+                onClick={() => {
+                  onSaveAiConfig({ ...aiConfig, apiKey: aiKeyInput });
+                  addLog("ok", "AI API key saved");
+                  setAiTestResult(null);
+                }}>
+                Save
+              </button>
+            </div>
+            {aiConfig?.apiKey && (
+              <div style={{ display: "flex", gap: 10, alignItems: "center" }}>
+                <span className="tag tag-green">✓ Key saved</span>
+                <button className="btn-ghost" style={{ fontSize: 11, padding: "4px 12px" }}
+                  disabled={aiTesting}
+                  onClick={async () => {
+                    setAiTesting(true); setAiTestResult(null);
+                    try {
+                      const res = await fetch("/ai-cookbook", {
+                        method: "POST",
+                        headers: { "Content-Type": "application/json" },
+                        body: JSON.stringify({
+                          recipes: [{ name: "Test Recipe", recipeCategory: [], tags: [] }],
+                          cookbooks: [],
+                          prompt: "Test connectivity only — return a single item",
+                          aiApiKey: aiConfig.apiKey,
+                          aiBaseUrl: aiConfig.baseUrl,
+                          aiModel: aiConfig.model,
+                        }),
+                      });
+                      const data = await res.json();
+                      if (data.error) throw new Error(data.error);
+                      setAiTestResult({ ok: true, msg: `Connected successfully using ${data.model}` });
+                    } catch (e) {
+                      setAiTestResult({ ok: false, msg: e.message });
+                    }
+                    setAiTesting(false);
+                  }}>
+                  {aiTesting ? <Spinner size={12} /> : "Test Connection"}
+                </button>
+                <button className="btn-danger" style={{ fontSize: 11, padding: "4px 12px" }}
+                  onClick={() => {
+                    setAiKeyInput("");
+                    onSaveAiConfig({ ...aiConfig, apiKey: "" });
+                    try { localStorage.removeItem(LS_AI_KEY); } catch {}
+                    addLog("ok", "AI API key cleared");
+                  }}>
+                  Clear Key
+                </button>
+              </div>
+            )}
+            {aiTestResult && (
+              <div style={{
+                marginTop: 12, padding: "10px 14px", borderRadius: 8, fontSize: 12,
+                background: aiTestResult.ok ? `${C.green}10` : "#1f0a0a",
+                border: `1px solid ${aiTestResult.ok ? C.green + "44" : "#3a1616"}`,
+                color: aiTestResult.ok ? C.green : C.red,
+              }}>
+                {aiTestResult.ok ? "✓" : "✗"} {aiTestResult.msg}
+              </div>
             )}
           </div>
         </div>

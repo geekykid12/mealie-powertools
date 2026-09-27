@@ -221,11 +221,17 @@ Only include recipe names that actually exist in my list above.`;
     if (isGemini) body.response_format = { type: "json_object" };
 
     console.log("[ai-taxonomy] calling", baseUrl, "model:", model, "type:", type);
-    const aiRes = await fetch(`${baseUrl}/chat/completions`, {
+    let aiRes;
+    try {
+      aiRes = await fetch(`${baseUrl}/chat/completions`, {
       method: "POST",
       headers: { "Content-Type": "application/json", Authorization: `Bearer ${aiApiKey}` },
       body: JSON.stringify(body),
     });
+
+    } catch (fetchErr) {
+      throw new Error(`fetch failed to reach ${baseUrl} — check network connectivity from the container: ${fetchErr.message}`);
+    }
 
     if (!aiRes.ok) {
       const err = await aiRes.text();

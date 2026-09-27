@@ -1,6 +1,8 @@
 # ─── Stage 1: Build React ─────────────────────────────────────────────────────
 FROM node:20-alpine AS builder
 
+RUN npm install -g npm@latest
+
 WORKDIR /app
 COPY package.json ./
 RUN npm install
@@ -9,6 +11,8 @@ RUN npm run build
 
 # ─── Stage 2: Runtime ─────────────────────────────────────────────────────────
 FROM node:20-alpine
+
+RUN npm install -g npm@latest
 
 WORKDIR /app
 
