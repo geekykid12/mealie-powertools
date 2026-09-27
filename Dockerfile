@@ -1,18 +1,14 @@
 # ─── Stage 1: Build React ─────────────────────────────────────────────────────
 FROM node:20-alpine AS builder
 
-RUN npm install -g npm@latest
-
 WORKDIR /app
 COPY package.json ./
-RUN npm install
+RUN npm install --no-fund --no-audit
 COPY . .
 RUN npm run build
 
 # ─── Stage 2: Runtime ─────────────────────────────────────────────────────────
 FROM node:20-alpine
-
-RUN npm install -g npm@latest
 
 WORKDIR /app
 
@@ -21,7 +17,7 @@ COPY --from=builder /app/dist ./dist
 
 # Install proxy server deps
 COPY server/package.json ./server/
-RUN cd server && npm install
+RUN cd server && npm install --no-fund --no-audit
 
 COPY server/index.js ./server/
 
