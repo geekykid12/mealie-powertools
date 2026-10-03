@@ -386,6 +386,50 @@ function LogPanel({ logs }) {
   );
 }
 
+
+// ─── Sortable/Filterable Table Header ────────────────────────────────────────
+function SortHeader({ label, field, sort, setSort, filter, setFilter, filterPlaceholder }) {
+  const [showFilter, setShowFilter] = useState(false);
+  const isActive = sort?.field === field;
+  const dir = isActive ? sort.dir : null;
+  return (
+    <th style={{ position: "relative", userSelect: "none" }}>
+      <div style={{ display: "flex", alignItems: "center", gap: 4 }}>
+        <span
+          style={{ cursor: "pointer", display: "flex", alignItems: "center", gap: 4 }}
+          onClick={() => setSort(s =>
+            s?.field === field ? { field, dir: s.dir === "asc" ? "desc" : "asc" } : { field, dir: "asc" }
+          )}>
+          {label}
+          <span style={{ fontSize: 10, color: isActive ? C.accent : C.border, lineHeight: 1 }}>
+            {dir === "asc" ? "▲" : dir === "desc" ? "▼" : "⇅"}
+          </span>
+        </span>
+        {setFilter && (
+          <span
+            style={{ cursor: "pointer", color: filter ? C.accent : C.muted, fontSize: 11, marginLeft: 2 }}
+            title="Filter this column"
+            onClick={() => setShowFilter(f => !f)}>
+            🔍
+          </span>
+        )}
+      </div>
+      {showFilter && setFilter && (
+        <div style={{ position: "absolute", top: "100%", left: 0, zIndex: 50, marginTop: 4, minWidth: 180 }}>
+          <input
+            autoFocus
+            value={filter || ""}
+            onChange={e => setFilter(e.target.value)}
+            placeholder={filterPlaceholder || `Filter ${label}…`}
+            style={{ fontSize: 11, padding: "5px 8px", borderColor: C.accent }}
+            onBlur={() => { if (!filter) setShowFilter(false); }}
+          />
+        </div>
+      )}
+    </th>
+  );
+}
+
 // ─── Cache Header ────────────────────────────────────────────────────────────
 function CacheHeader({ loadedAt, onReload, loading, label }) {
   const [, tick] = useState(0);
@@ -433,6 +477,8 @@ function RecipesSection({ api, addLog, cache, onCache }) {
   const [editFull, setEditFull] = useState(null);
   const [saving, setSaving] = useState(false);
   const [parsingSlug, setParsingSlug] = useState(null);
+  const [tableSort, setTableSort] = useState({ field: "name", dir: "asc" });
+  const [colFilters, setColFilters] = useState({});
   const PER = 20;
 
   const load = useCallback(async (p = 1, q = "") => {
@@ -526,18 +572,29 @@ function RecipesSection({ api, addLog, cache, onCache }) {
       <div className="card" style={{ padding: 0, overflow: "hidden" }}>
         {loading ? (
           <div style={{ padding: 40, textAlign: "center" }}><Spinner size={24} /></div>
-        ) : (
+        ) : (() => {
+          // Apply column filters then sort
+          let rows = (recipes || []);
+          if (colFilters.name) rows = rows.filter(r => r.name.toLowerCase().includes(colFilters.name.toLowerCase()));
+          if (colFilters.categories) rows = rows.filter(r => (r.recipeCategory || []).some(c => c.name.toLowerCase().includes(colFilters.categories.toLowerCase())));
+          rows = [...rows].sort((a, b) => {
+            let av = a[tableSort.field] || "", bv = b[tableSort.field] || "";
+            if (tableSort.field === "categories") { av = (a.recipeCategory || [])[0]?.name || ""; bv = (b.recipeCategory || [])[0]?.name || ""; }
+            const cmp = String(av).localeCompare(String(bv));
+            return tableSort.dir === "asc" ? cmp : -cmp;
+          });
+          return (
           <table>
             <thead>
               <tr>
-                <th>Name</th>
-                <th>Categories</th>
+                <SortHeader label="Name" field="name" sort={tableSort} setSort={setTableSort} filter={colFilters.name} setFilter={v => setColFilters(f => ({ ...f, name: v }))} />
+                <SortHeader label="Categories" field="categories" sort={tableSort} setSort={setTableSort} filter={colFilters.categories} setFilter={v => setColFilters(f => ({ ...f, categories: v }))} filterPlaceholder="Filter by category…" />
                 <th>Ingredients</th>
                 <th>Actions</th>
               </tr>
             </thead>
             <tbody>
-              {(recipes || []).map(r => (
+              {rows.map(r => (
                 <tr key={r.id}>
                   <td style={{ fontWeight: 500 }}>{r.name}</td>
                   <td>
@@ -612,7 +669,8 @@ function RecipesSection({ api, addLog, cache, onCache }) {
               ))}
             </tbody>
           </table>
-        )}
+          );
+        })()}
       </div>
 
       <div style={{ display: "flex", gap: 8, justifyContent: "center" }}>
@@ -1276,7 +1334,7 @@ function HouseholdsSection({ api, addLog, cache, onCache }) {
   const [households, setHouseholds] = useState(cache?.households || []);
   const [users, setUsers] = useState(cache?.users || []);
   const [selectedHousehold, setSelectedHousehold] = useState(cache?.selectedHousehold || null);
-  const [loading, setLoading] = useState(!cache);
+  const [loading, setLoading] = useState(!cache || cache.activeType !== (cache?.activeType || "tags"));
   const [creating, setCreating] = useState(false);
   const [editUser, setEditUser] = useState(null);
   const [newUser, setNewUser] = useState({ username: "", email: "", password: "", fullName: "", admin: false });
@@ -2401,7 +2459,7 @@ export default function App() {
             {tab === "dashboard"  && <DashboardSection  api={conn.api} user={conn.user} addLog={addLog} onNavigate={setTab} />}
             {tab === "recipes"    && <RecipesSection    api={conn.api} addLog={addLog} cache={recipeCache} onCache={setRecipeCache} />}
             {tab === "parser"     && <ParserSection     api={conn.api} addLog={addLog} />}
-            {tab === "bulk"       && <BulkSection       api={conn.api} addLog={addLog} />}
+            {tab === "bulk"       && <BulkSection       api={conn.api} addLog={addLog} aiConfig={aiConfig} />}
             {tab === "taxonomy"   && <TaxonomySection   api={conn.api} addLog={addLog} cache={taxonomyCache} onCache={setTaxonomyCache} aiConfig={aiConfig} />}
             {tab === "cookbooks"  && <CookbooksSection  api={conn.api} addLog={addLog} cache={cookbooksCache} onCache={setCookbooksCache} aiConfig={aiConfig} />}
             {tab === "quality"    && <DataQualitySection api={conn.api} addLog={addLog} savedResults={qualityResults} onSaveResults={setQualityResults} />}
@@ -2425,7 +2483,7 @@ export default function App() {
 }
 
 // ─── SECTION: Bulk Operations ─────────────────────────────────────────────────
-function BulkSection({ api, addLog }) {
+function BulkSection({ api, addLog, aiConfig }) {
   const [recipes, setRecipes] = useState([]);
   const [selected, setSelected] = useState(new Set());
   const [loading, setLoading] = useState(true);
@@ -2437,6 +2495,13 @@ function BulkSection({ api, addLog }) {
   const [assignCat, setAssignCat] = useState("");
   const [assignCb, setAssignCb] = useState("");
   const [running, setRunning] = useState(false);
+  // AI state
+  const [aiOpen, setAiOpen] = useState(false);
+  const [aiType, setAiType] = useState("tags"); // "tags" | "categories"
+  const [aiLoading, setAiLoading] = useState(false);
+  const [aiResults, setAiResults] = useState(null);
+  const [aiError, setAiError] = useState("");
+  const [aiSelected, setAiSelected] = useState(new Set());
 
   useEffect(() => {
     (async () => {
@@ -2496,6 +2561,9 @@ function BulkSection({ api, addLog }) {
           }
         }
         addLog("ok", `Category "${cat?.name}" assigned to ${slugs.length} recipes`);
+      } else if (action === "cookbook" && assignCb) {
+        // Mealie cookbooks use filter rules not recipe lists — we can only note this
+        addLog("warn", `Note: Mealie cookbooks use filter rules. Cookbook "${cookbooks.find(c=>c.id===assignCb)?.name}" cannot directly contain recipes — use Tags/Categories to filter into it.`);
       } else if (action === "delete") {
         if (!confirm(`Permanently delete ${selected.size} recipes?`)) { setRunning(false); return; }
         for (const slug of slugs) { await api.delete(`/recipes/${slug}`); }
@@ -2506,6 +2574,49 @@ function BulkSection({ api, addLog }) {
       }
     } catch (e) { addLog("error", e.message); }
     setRunning(false);
+  };
+
+  const generateAiSuggestions = async () => {
+    setAiLoading(true); setAiError(""); setAiResults(null); setAiSelected(new Set());
+    try {
+      const selectedRecipes = recipes.filter(r => selected.has(r.id));
+      const res = await fetch("/ai-taxonomy", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          recipes: selectedRecipes.length > 0 ? selectedRecipes : recipes,
+          existingItems: aiType === "tags" ? tags : categories,
+          type: aiType,
+          prompt: `Suggest ${aiType} specifically for the selected recipes`,
+          aiApiKey: aiConfig?.apiKey || "",
+          aiBaseUrl: aiConfig?.baseUrl || "",
+          aiModel: aiConfig?.model || "",
+        }),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error);
+      setAiResults(data.suggestions);
+      setAiSelected(new Set(data.suggestions.map((_, i) => i)));
+    } catch (e) { setAiError(e.message); }
+    setAiLoading(false);
+  };
+
+  const createAiItems = async () => {
+    const toCreate = (aiResults || []).filter((_, i) => aiSelected.has(i));
+    const endpoint = aiType === "tags" ? "/organizers/tags" : "/organizers/categories";
+    for (const s of toCreate) {
+      try {
+        await api.post(endpoint, { name: s.name });
+        addLog("ok", `Created ${aiType.slice(0,-1)}: ${s.name}`);
+      } catch (e) { addLog("error", e.message); }
+    }
+    setAiOpen(false); setAiResults(null);
+    // Reload tags/categories
+    const [t, c] = await Promise.all([
+      api.get("/organizers/tags?perPage=500"),
+      api.get("/organizers/categories?perPage=500"),
+    ]);
+    setTags(t.items || []); setCategories(c.items || []);
   };
 
   return (
@@ -2541,10 +2652,29 @@ function BulkSection({ api, addLog }) {
             </button>
           </div>
         </div>
-        <button className="btn-danger" onClick={() => run("delete")} disabled={running || selected.size === 0}
-          style={{ alignSelf: "flex-end" }}>
-          🗑 Delete {selected.size > 0 ? selected.size : ""} Selected
-        </button>
+        <div style={{ display: "flex", flexDirection: "column", gap: 6, flex: 1, minWidth: 180 }}>
+          <label style={{ fontSize: 11, color: C.muted, textTransform: "uppercase", letterSpacing: ".06em" }}>Add to Cookbook</label>
+          <div style={{ display: "flex", gap: 8 }}>
+            <select value={assignCb} onChange={e => setAssignCb(e.target.value)} style={{ flex: 1 }}>
+              <option value="">Select cookbook…</option>
+              {cookbooks.map(c => <option key={c.id} value={c.id}>{c.name}</option>)}
+            </select>
+            <button className="btn-success" onClick={() => run("cookbook")} disabled={running || !assignCb || selected.size === 0}>
+              Apply to {selected.size}
+            </button>
+          </div>
+        </div>
+        <div style={{ display: "flex", gap: 8, alignSelf: "flex-end", flexWrap: "wrap" }}>
+          {aiConfig?.enabled && aiConfig?.apiKey && (
+            <button className="btn-ghost" style={{ color: "#a855f7", borderColor: "#a855f744", padding: "8px 14px" }}
+              onClick={() => setAiOpen(true)}>
+              ✨ AI Suggest Tags/Cats
+            </button>
+          )}
+          <button className="btn-danger" onClick={() => run("delete")} disabled={running || selected.size === 0}>
+            🗑 Delete {selected.size > 0 ? selected.size : ""} Selected
+          </button>
+        </div>
       </div>
 
       {/* Search + table */}
@@ -2554,6 +2684,70 @@ function BulkSection({ api, addLog }) {
         </div>
         <input style={{ paddingLeft: 32 }} placeholder="Filter recipes…" value={search} onChange={e => setSearch(e.target.value)} />
       </div>
+
+      {/* AI Suggest Modal */}
+      {aiOpen && (
+        <div style={{ position: "fixed", inset: 0, background: "#000c", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 100, padding: 20 }}>
+          <div className="card fade-up" style={{ width: 600, maxHeight: "85vh", display: "flex", flexDirection: "column" }}>
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 16, flexShrink: 0 }}>
+              <div style={{ fontWeight: 700, fontSize: 16 }}>✨ AI Tag & Category Suggestions</div>
+              <button className="btn-ghost" style={{ padding: "4px 8px" }} onClick={() => setAiOpen(false)}>
+                <Icon name="close" size={14} />
+              </button>
+            </div>
+            <div style={{ display: "flex", gap: 8, marginBottom: 14, flexShrink: 0 }}>
+              {["tags", "categories"].map(t => (
+                <button key={t} onClick={() => { setAiType(t); setAiResults(null); }} style={{
+                  padding: "6px 16px", borderRadius: 8, border: `2px solid`,
+                  borderColor: aiType === t ? C.accent : C.border,
+                  background: aiType === t ? `${C.accent}18` : C.surfaceAlt,
+                  color: aiType === t ? C.accent : C.muted,
+                  fontWeight: 600, fontSize: 12, cursor: "pointer",
+                }}>{t.charAt(0).toUpperCase() + t.slice(1)}</button>
+              ))}
+              <div style={{ fontSize: 12, color: C.muted, alignSelf: "center", marginLeft: 8 }}>
+                {selected.size > 0 ? `Based on ${selected.size} selected recipes` : "Based on all recipes"}
+              </div>
+            </div>
+            <button className="btn-primary" style={{ marginBottom: 14, padding: 10, flexShrink: 0 }}
+              onClick={generateAiSuggestions} disabled={aiLoading}>
+              {aiLoading ? <span style={{ display: "flex", alignItems: "center", gap: 8, justifyContent: "center" }}><Spinner size={14} /> Analyzing…</span> : `✨ Generate ${aiType} suggestions`}
+            </button>
+            {aiError && <div style={{ color: C.red, fontSize: 12, marginBottom: 12, flexShrink: 0 }}>⚠ {aiError}</div>}
+            {aiResults && (
+              <div style={{ flex: 1, overflowY: "auto", display: "flex", flexDirection: "column", gap: 8 }}>
+                {aiResults.map((s, i) => {
+                  const exists = (aiType === "tags" ? tags : categories).some(x => x.name.toLowerCase() === s.name.toLowerCase());
+                  return (
+                    <div key={i} className="card" style={{ padding: 12, cursor: exists ? "default" : "pointer", opacity: exists ? .6 : 1,
+                      border: `1px solid ${aiSelected.has(i) ? C.accent + "66" : C.border}`,
+                      background: aiSelected.has(i) ? `${C.accent}0a` : C.card,
+                    }}
+                      onClick={() => { if (exists) return; setAiSelected(s => { const n = new Set(s); n.has(i) ? n.delete(i) : n.add(i); return n; }); }}>
+                      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+                        <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                          {!exists && <input type="checkbox" checked={aiSelected.has(i)} onChange={() => {}} onClick={e => e.stopPropagation()} />}
+                          <span style={{ fontWeight: 600 }}>{s.name}</span>
+                          {exists && <span className="tag tag-muted">already exists</span>}
+                        </div>
+                        <span style={{ fontSize: 11, color: C.muted }}>{(s.matchingRecipes || []).length} recipes</span>
+                      </div>
+                      <div style={{ fontSize: 12, color: C.muted, marginTop: 4 }}>{s.description}</div>
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+            {aiResults && aiSelected.size > 0 && (
+              <div style={{ paddingTop: 12, borderTop: `1px solid ${C.border}`, flexShrink: 0, marginTop: 10 }}>
+                <button className="btn-primary" style={{ width: "100%", padding: 10 }} onClick={createAiItems}>
+                  + Create {aiSelected.size} Selected {aiType}
+                </button>
+              </div>
+            )}
+          </div>
+        </div>
+      )}
 
       <div className="card" style={{ padding: 0, overflow: "hidden" }}>
         {loading ? <div style={{ padding: 40, textAlign: "center" }}><Spinner size={24} /></div> : (
@@ -2616,6 +2810,7 @@ function TaxonomySection({ api, addLog, cache, onCache, aiConfig }) {
 
   const load = useCallback(async () => {
     setLoading(true);
+    setItems([]); setRecipeCounts({});
     try {
       const d = await api.get(`${endpoint}?perPage=500`);
       const list = d.items || [];
@@ -2647,7 +2842,7 @@ function TaxonomySection({ api, addLog, cache, onCache, aiConfig }) {
       onCache({ items: list, recipeCounts: counts, allRecipes: recipesForAi, activeType, loadedAt: Date.now() });
     } catch (e) { addLog("error", e.message); }
     setLoading(false);
-  }, [api, activeType]);
+  }, [api, activeType]); // cache bust when activeType changes
 
   useEffect(() => { load(); }, [load]);
 
@@ -3773,8 +3968,12 @@ function ActivitySection({ api, addLog }) {
 
   const timeAgo = (dt) => {
     if (!dt) return "—";
-    const diff = Date.now() - new Date(dt).getTime();
-    const days = Math.floor(diff / 86400000);
+    // Compare local calendar dates to avoid timezone off-by-one
+    const now   = new Date();
+    const then  = new Date(dt);
+    const nowDate  = new Date(now.getFullYear(),  now.getMonth(),  now.getDate());
+    const thenDate = new Date(then.getFullYear(), then.getMonth(), then.getDate());
+    const days = Math.round((nowDate - thenDate) / 86400000);
     if (days === 0) return "Today";
     if (days === 1) return "Yesterday";
     if (days < 7) return `${days} days ago`;
