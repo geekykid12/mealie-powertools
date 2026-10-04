@@ -4107,6 +4107,7 @@ function ActivitySection({ api, addLog }) {
           </table>
         </div>
       )}
-    </div>
+      )}
+      </div>
   );
 }
