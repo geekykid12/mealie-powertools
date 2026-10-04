@@ -1,5 +1,8 @@
 # 🔧 Mealie PowerTools
 
+<a href="https://www.buymeacoffee.com/geekykid12" target="_blank"><img src="https://cdn.buymeacoffee.com/buttons/v2/default-orange.png" alt="Buy Me A Coffee" style="height: 30px !important;width: 107px !important;" ></a>
+
+
 A self-hosted admin dashboard for your [Mealie](https://github.com/mealie-recipes/mealie) recipe server. PowerTools gives you capabilities that go beyond Mealie's built-in UI — bulk operations, data quality auditing, full recipe editing, ingredient parser review, and server-wide admin controls.
 
 ## Features

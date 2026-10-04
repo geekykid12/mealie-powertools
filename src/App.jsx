@@ -479,6 +479,7 @@ function RecipesSection({ api, addLog, cache, onCache }) {
   const [parsingSlug, setParsingSlug] = useState(null);
   const [tableSort, setTableSort] = useState({ field: "name", dir: "asc" });
   const [colFilters, setColFilters] = useState({});
+  const fmtDate = (dt) => dt ? new Date(dt).toLocaleDateString("en-US", { month: "short", day: "numeric", year: "numeric" }) : "—";
   const PER = 20;
 
   const load = useCallback(async (p = 1, q = "") => {
@@ -580,6 +581,11 @@ function RecipesSection({ api, addLog, cache, onCache }) {
           rows = [...rows].sort((a, b) => {
             let av = a[tableSort.field] || "", bv = b[tableSort.field] || "";
             if (tableSort.field === "categories") { av = (a.recipeCategory || [])[0]?.name || ""; bv = (b.recipeCategory || [])[0]?.name || ""; }
+            if (tableSort.field === "dateAdded" || tableSort.field === "dateUpdated") {
+              av = av ? new Date(av).getTime() : 0;
+              bv = bv ? new Date(bv).getTime() : 0;
+              return tableSort.dir === "asc" ? av - bv : bv - av;
+            }
             const cmp = String(av).localeCompare(String(bv));
             return tableSort.dir === "asc" ? cmp : -cmp;
           });
@@ -590,6 +596,8 @@ function RecipesSection({ api, addLog, cache, onCache }) {
                 <SortHeader label="Name" field="name" sort={tableSort} setSort={setTableSort} filter={colFilters.name} setFilter={v => setColFilters(f => ({ ...f, name: v }))} />
                 <SortHeader label="Categories" field="categories" sort={tableSort} setSort={setTableSort} filter={colFilters.categories} setFilter={v => setColFilters(f => ({ ...f, categories: v }))} filterPlaceholder="Filter by category…" />
                 <th>Ingredients</th>
+                <SortHeader label="Added" field="dateAdded" sort={tableSort} setSort={setTableSort} />
+                <SortHeader label="Modified" field="dateUpdated" sort={tableSort} setSort={setTableSort} />
                 <th>Actions</th>
               </tr>
             </thead>
@@ -616,6 +624,8 @@ function RecipesSection({ api, addLog, cache, onCache }) {
                       );
                     })()}
                   </td>
+                  <td style={{ fontSize: 11, color: C.muted, whiteSpace: "nowrap" }}>{fmtDate(r.dateAdded)}</td>
+                  <td style={{ fontSize: 11, color: C.muted, whiteSpace: "nowrap" }}>{fmtDate(r.dateUpdated)}</td>
                   <td>
                     <div style={{ display: "flex", gap: 6 }}>
                       <button className="btn-ghost" style={{ padding: "5px 10px" }}
@@ -1500,7 +1510,13 @@ function HouseholdsSection({ api, addLog, cache, onCache }) {
                 </div>
                 <table>
                   <thead>
-                    <tr><th>User</th><th>Email</th><th>Role</th><th>Status</th><th>Actions</th></tr>
+                    <tr>
+                    <th>User</th>
+                    <th>Email</th>
+                    <th>Role</th>
+                    <th>Status</th>
+                    <th>Actions</th>
+                  </tr>
                   </thead>
                   <tbody>
                     {householdUsers.map(m => (
@@ -2794,6 +2810,8 @@ function TaxonomySection({ api, addLog, cache, onCache, aiConfig }) {
   const [editItem, setEditItem] = useState(null);
   const [editName, setEditName] = useState("");
   const [saving, setSaving] = useState(false);
+  const [tableSort, setTableSort] = useState({ field: "name", dir: "asc" });
+  const [nameFilter, setNameFilter] = useState("");
 
   // AI state — credentials come from global aiConfig (set in Admin → AI)
   const [aiOpen, setAiOpen] = useState(false);
@@ -2842,9 +2860,19 @@ function TaxonomySection({ api, addLog, cache, onCache, aiConfig }) {
       onCache({ items: list, recipeCounts: counts, allRecipes: recipesForAi, activeType, loadedAt: Date.now() });
     } catch (e) { addLog("error", e.message); }
     setLoading(false);
-  }, [api, activeType]); // cache bust when activeType changes
+  }, [api, activeType]);
 
-  useEffect(() => { load(); }, [load]);
+  useEffect(() => {
+    // Skip load if we have a fresh cache for this activeType
+    if (cache && cache.activeType === activeType && cache.items?.length > 0) {
+      setItems(cache.items);
+      setRecipeCounts(cache.recipeCounts || {});
+      setAllRecipes(cache.allRecipes || []);
+      setLoading(false);
+      return;
+    }
+    load();
+  }, [activeType]); // only re-run when type switches, not on every render
 
   const create = async () => {
     if (!newName.trim()) return;
@@ -2991,13 +3019,27 @@ function TaxonomySection({ api, addLog, cache, onCache, aiConfig }) {
 
       {/* List */}
       <div className="card" style={{ padding: 0, overflow: "hidden" }}>
-        {loading ? <div style={{ padding: 40, textAlign: "center" }}><Spinner size={24} /></div> : (
+        {loading ? <div style={{ padding: 40, textAlign: "center" }}><Spinner size={24} /></div> : (() => {
+          let rows = items.filter(i => !nameFilter || i.name.toLowerCase().includes(nameFilter.toLowerCase()));
+          rows = [...rows].sort((a, b) => {
+            let av, bv;
+            if (tableSort.field === "recipes") { av = recipeCounts[a.id] || 0; bv = recipeCounts[b.id] || 0; return tableSort.dir === "asc" ? av - bv : bv - av; }
+            av = a.name || ""; bv = b.name || "";
+            const cmp = av.localeCompare(bv);
+            return tableSort.dir === "asc" ? cmp : -cmp;
+          });
+          return (
           <table>
             <thead>
-              <tr><th>Name</th><th>Recipes</th><th>Status</th><th>Actions</th></tr>
+              <tr>
+                <SortHeader label="Name" field="name" sort={tableSort} setSort={setTableSort} filter={nameFilter} setFilter={setNameFilter} />
+                <SortHeader label="Recipes" field="recipes" sort={tableSort} setSort={setTableSort} />
+                <th>Status</th>
+                <th>Actions</th>
+              </tr>
             </thead>
             <tbody>
-              {items.sort((a, b) => (recipeCounts[b.id] || 0) - (recipeCounts[a.id] || 0)).map(item => (
+              {rows.map(item => (
                 <tr key={item.id}>
                   <td style={{ fontWeight: 500 }}>{item.name}</td>
                   <td><span className="mono" style={{ color: C.muted, fontSize: 12 }}>{recipeCounts[item.id] ?? "…"}</span></td>
@@ -3021,7 +3063,8 @@ function TaxonomySection({ api, addLog, cache, onCache, aiConfig }) {
               ))}
             </tbody>
           </table>
-        )}
+          );
+        })()}
       </div>
 
       {/* Edit modal */}
@@ -3439,6 +3482,8 @@ function AdminSection({ api, addLog, aiConfig, onSaveAiConfig }) {
   const [newUser, setNewUser] = useState({ username: "", email: "", password: "", fullName: "", admin: false });
   const [creating, setCreating] = useState(false);
   const [saving, setSaving] = useState(false);
+  const [userSort, setUserSort] = useState({ field: "fullName", dir: "asc" });
+  const [userFilter, setUserFilter] = useState("");
   // AI Settings tab state
   const [aiProviderInfo, setAiProviderInfo] = useState(null);
   const [aiInfoLoading, setAiInfoLoading] = useState(false);
@@ -3545,13 +3590,33 @@ function AdminSection({ api, addLog, aiConfig, onSaveAiConfig }) {
             <button className="btn-primary" onClick={() => setCreating(true)}>+ New User</button>
           </div>
           <div className="card" style={{ padding: 0, overflow: "hidden" }}>
-            {loading ? <div style={{ padding: 40, textAlign: "center" }}><Spinner size={24} /></div> : (
+            {loading ? <div style={{ padding: 40, textAlign: "center" }}><Spinner size={24} /></div> : (() => {
+              let rows = users.filter(u => !userFilter ||
+                (u.fullName || u.username || "").toLowerCase().includes(userFilter.toLowerCase()) ||
+                (u.email || "").toLowerCase().includes(userFilter.toLowerCase())
+              );
+              rows = [...rows].sort((a, b) => {
+                let av = "", bv = "";
+                if (userSort.field === "fullName") { av = a.fullName || a.username || ""; bv = b.fullName || b.username || ""; }
+                else if (userSort.field === "email") { av = a.email || ""; bv = b.email || ""; }
+                else if (userSort.field === "household") { av = a.household || ""; bv = b.household || ""; }
+                const cmp = av.localeCompare(bv);
+                return userSort.dir === "asc" ? cmp : -cmp;
+              });
+              return (
               <table>
                 <thead>
-                  <tr><th>User</th><th>Email</th><th>Household</th><th>Role</th><th>Status</th><th>Actions</th></tr>
+                  <tr>
+                    <SortHeader label="User" field="fullName" sort={userSort} setSort={setUserSort} filter={userFilter} setFilter={setUserFilter} filterPlaceholder="Filter by name or email…" />
+                    <SortHeader label="Email" field="email" sort={userSort} setSort={setUserSort} />
+                    <SortHeader label="Household" field="household" sort={userSort} setSort={setUserSort} />
+                    <th>Role</th>
+                    <th>Status</th>
+                    <th>Actions</th>
+                  </tr>
                 </thead>
                 <tbody>
-                  {users.map(u => (
+                  {rows.map(u => (
                     <tr key={u.id}>
                       <td>
                         <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
@@ -3592,7 +3657,8 @@ function AdminSection({ api, addLog, aiConfig, onSaveAiConfig }) {
                   ))}
                 </tbody>
               </table>
-            )}
+              );
+            })()}
           </div>
         </div>
       )}
@@ -3948,6 +4014,8 @@ function ActivitySection({ api, addLog }) {
   const [recipes, setRecipes] = useState([]);
   const [loading, setLoading] = useState(true);
   const [sort, setSort] = useState("dateUpdated");
+  const [tableSort, setTableSort] = useState({ field: "dateUpdated", dir: "desc" });
+  const [nameFilter, setNameFilter] = useState("");
 
   useEffect(() => {
     (async () => {
@@ -3996,19 +4064,26 @@ function ActivitySection({ api, addLog }) {
         ))}
       </div>
 
-      {loading ? <div style={{ textAlign: "center", padding: 60 }}><Spinner size={32} /></div> : (
+      {loading ? <div style={{ textAlign: "center", padding: 60 }}><Spinner size={32} /></div> : (() => {
+        let rows = recipes.filter(r => !nameFilter || r.name.toLowerCase().includes(nameFilter.toLowerCase()));
+        rows = [...rows].sort((a, b) => {
+          const av = a[tableSort.field] ? new Date(a[tableSort.field]).getTime() : 0;
+          const bv = b[tableSort.field] ? new Date(b[tableSort.field]).getTime() : 0;
+          return tableSort.dir === "asc" ? av - bv : bv - av;
+        });
+        return (
         <div className="card" style={{ padding: 0, overflow: "hidden" }}>
           <table>
             <thead>
               <tr>
-                <th>Recipe</th>
-                <th>Added</th>
-                <th>Last Modified</th>
-                <th>Last Cooked</th>
+                <SortHeader label="Recipe" field="name" sort={tableSort} setSort={setTableSort} filter={nameFilter} setFilter={setNameFilter} />
+                <SortHeader label="Added" field="dateAdded" sort={tableSort} setSort={setTableSort} />
+                <SortHeader label="Last Modified" field="dateUpdated" sort={tableSort} setSort={setTableSort} />
+                <SortHeader label="Last Cooked" field="lastMade" sort={tableSort} setSort={setTableSort} />
               </tr>
             </thead>
             <tbody>
-              {recipes.map(r => (
+              {rows.map(r => (
                 <tr key={r.id}>
                   <td>
                     <div style={{ fontWeight: 500 }}>{r.name}</div>
