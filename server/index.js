@@ -1,6 +1,7 @@
 const express = require("express");
 const { createProxyMiddleware, fixRequestBody } = require("http-proxy-middleware");
 const path = require("path");
+const { Readable } = require("stream");
 
 const app = express();
 app.use(express.json({ limit: "10mb" }));
@@ -203,7 +204,7 @@ app.post("/ai-taxonomy", async (req, res) => {
 
     const userPrompt = `Here are my ${recipes.length} recipes:
 ${recipeList}
-${existing ? "\nAlready have these ${typePlural} (do NOT suggest these): " + existing + "\n" : ""}
+ ${existing ? `\nAlready have these ${typePlural} (do NOT suggest these): ${existing}\n` : ""}
 ${prompt ? "User request: " + prompt + "\n" : ""}
 Suggest 5-10 useful ${typePlural} for this collection. Return a JSON array where each item is:
 {"name":"Category Name","description":"One sentence about which recipes this applies to","matchingRecipes":["Recipe Name 1","Recipe Name 2"]}
@@ -265,7 +266,12 @@ app.get("/img", async (req, res) => {
     if (!imgRes.ok) return res.status(imgRes.status).send("Image fetch failed");
     res.set("Content-Type", imgRes.headers.get("content-type") || "image/webp");
     res.set("Cache-Control", "public, max-age=3600");
-    imgRes.body.pipe(res);
+    // Native fetch returns a Web ReadableStream, not a Node stream.
+    if (imgRes.body && typeof Readable.fromWeb === "function") {
+      Readable.fromWeb(imgRes.body).pipe(res);
+    } else {
+      res.end(Buffer.from(await imgRes.arrayBuffer()));
+    }
   } catch (e) {
     console.error("[img proxy]", e.message);
     res.status(502).send("Image proxy error");

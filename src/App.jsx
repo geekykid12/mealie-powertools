@@ -196,18 +196,28 @@ const Icon = ({ name, size = 16, color = "currentColor" }) => {
 
 // ─── API Client ───────────────────────────────────────────────────────────────
 function makeApi(baseUrl, token) {
+  const normalizedBaseUrl = baseUrl.trim().replace(/\/+$/, "");
   const headers = {
     "Content-Type": "application/json",
-    "X-Mealie-Url": baseUrl.trim(),
+    "X-Mealie-Url": normalizedBaseUrl,
     ...(token ? { Authorization: `Bearer ${token.trim()}` } : {}),
   };
   const req = async (method, path, body) => {
     const r = await fetch(`/api${path}`, {
-      method, headers, body: body ? JSON.stringify(body) : undefined,
+      method, headers, body: body === undefined ? undefined : JSON.stringify(body),
     });
-    if (!r.ok) throw new Error(`${r.status} ${r.statusText}`);
     if (r.status === 204) return null;
-    return r.json();
+    const responseText = await r.text();
+    let responseBody = null;
+    try { responseBody = responseText ? JSON.parse(responseText) : null; } catch { /* non-JSON response */ }
+    if (!r.ok) {
+      const detail = responseBody?.detail;
+      const detailMessage = typeof detail === "string" ? detail
+        : Array.isArray(detail) ? detail.map(item => item?.msg || item?.message || String(item)).join("; ")
+        : detail?.message || detail?.msg || responseBody?.message;
+      throw new Error(`${r.status} ${r.statusText}${detailMessage ? `: ${detailMessage}` : ""}`);
+    }
+    return responseBody;
   };
   return {
     get: (p) => req("GET", p),
@@ -215,9 +225,23 @@ function makeApi(baseUrl, token) {
     put: (p, b) => req("PUT", p, b),
     patch: (p, b) => req("PATCH", p, b),
     delete: (p) => req("DELETE", p),
-    _base: baseUrl,
+    _base: normalizedBaseUrl,
+    _token: token,
   };
 }
+
+// Mealie can return newly parsed foods/units without database IDs. Those
+// relations cannot be written back as { id: null, name }, so keep only
+// resolvable relations in recipe update payloads.
+const ingredientForSave = (ing) => ({
+  ...ing,
+  food: ing.food?.id ? { id: ing.food.id, name: ing.food.name } : null,
+  unit: ing.unit?.id ? { id: ing.unit.id, name: ing.unit.name } : null,
+});
+
+const normalizeAiSuggestions = (value) => (Array.isArray(value) ? value : [])
+  .flat(Infinity)
+  .filter(s => s && typeof s === "object" && typeof s.name === "string" && s.name.trim());
 
 // ─── Connection Setup ─────────────────────────────────────────────────────────
 const LS_URL    = "mpt_url";
@@ -467,7 +491,7 @@ function CacheHeader({ loadedAt, onReload, loading, label }) {
 }
 
 // ─── SECTION: Recipes ─────────────────────────────────────────────────────────
-function RecipesSection({ api, addLog, cache, onCache }) {
+function RecipesSection({ api, addLog, cache, onCache, parserEngine }) {
   const [recipes, setRecipes] = useState(cache?.recipes || null);
   const [search, setSearch] = useState(cache?.search || "");
   const [page, setPage] = useState(cache?.page || 1);
@@ -529,11 +553,7 @@ function RecipesSection({ api, addLog, cache, onCache }) {
         recipeYield: editFull.recipeYield,
         orgURL: editFull.orgURL,
         rating: editFull.rating,
-        recipeIngredient: (editFull.recipeIngredient || []).map(ing => ({
-          ...ing,
-          food: ing.food ? { id: ing.food.id, name: ing.food.name } : null,
-          unit: ing.unit ? { id: ing.unit.id, name: ing.unit.name } : null,
-        })),
+        recipeIngredient: (editFull.recipeIngredient || []).map(ingredientForSave),
         recipeInstructions: editFull.recipeInstructions,
         notes: editFull.notes,
       });
@@ -635,27 +655,32 @@ function RecipesSection({ api, addLog, cache, onCache }) {
                           setParsingSlug(r.slug);
                           try {
                             const full = await api.get(`/recipes/${r.slug}`);
+                            const inputIndexes = [];
                             const ings = (full.recipeIngredient || [])
-                              .filter(i => i.display || i.note)
-                              .map(i => i.display || i.note || "");
+                              .map((i, index) => {
+                                if (!i.display && !i.note) return null;
+                                inputIndexes.push(index);
+                                return i.display || i.note || "";
+                              })
+                              .filter(Boolean);
                             if (ings.length) {
                               const parsed = await api.post("/parser/ingredients", {
                                 ingredients: ings,
-                                parser: "nlp"
+                                parser: parserEngine
                               });
-                              const updated = full.recipeIngredient.map((ing, idx) => ({
-                                ...ing, ...(parsed[idx] ? {
-                                  food: parsed[idx].ingredient?.food,
-                                  unit: parsed[idx].ingredient?.unit,
-                                  quantity: parsed[idx].ingredient?.quantity,
-                                } : {})
-                              }));
+                              const updated = full.recipeIngredient.map((ing, idx) => {
+                                const parsedIndex = inputIndexes.indexOf(idx);
+                                const parsedIngredient = parsedIndex >= 0 ? parsed[parsedIndex] : null;
+                                return {
+                                  ...ing, ...(parsedIngredient ? {
+                                    food: parsedIngredient.ingredient?.food,
+                                    unit: parsedIngredient.ingredient?.unit,
+                                    quantity: parsedIngredient.ingredient?.quantity,
+                                  } : {})
+                                };
+                              });
                               await api.patch(`/recipes/${r.slug}`, {
-                                recipeIngredient: updated.map(ing => ({
-                                  ...ing,
-                                  food: ing.food ? { id: ing.food.id, name: ing.food.name } : null,
-                                  unit: ing.unit ? { id: ing.unit.id, name: ing.unit.name } : null,
-                                }))
+                                recipeIngredient: updated.map(ingredientForSave)
                               });
                               addLog("ok", `Parsed: ${r.name}`);
                               load(page, search);
@@ -918,13 +943,12 @@ function RecipesSection({ api, addLog, cache, onCache }) {
 }
 
 // ─── SECTION: Ingredient Parser ───────────────────────────────────────────────
-function ParserSection({ api, addLog }) {
+function ParserSection({ api, addLog, parserEngine }) {
   const [mode, setMode] = useState("unparsed");
   const [reviewMode, setReviewMode] = useState(true); // show review step before saving
   const [running, setRunning] = useState(false);
   const [progress, setProgress] = useState({ done: 0, total: 0 });
   const [logs, setLogs] = useState([]);
-  const [parser, setParser] = useState("nlp");
   const [batchSize, setBatchSize] = useState(10);
   const abortRef = useRef(false);
 
@@ -959,16 +983,27 @@ function ParserSection({ api, addLog }) {
 
   const callParser = async (recipe) => {
     // Filter out section headers (title-only entries with no display/note)
+    const inputIndexes = [];
     const ingredients = (recipe.recipeIngredient || [])
-      .filter(i => i.display || i.note)
-      .map(i => i.display || i.note || "");
+      .map((i, index) => {
+        if (!i.display && !i.note) return null;
+        inputIndexes.push(index);
+        return i.display || i.note || "";
+      })
+      .filter(Boolean);
     if (!ingredients.length) return null;
     // API expects an array of strings, not objects
     const parsed = await api.post("/parser/ingredients", {
       ingredients,
-      parser,
+      parser: parserEngine,
     });
-    return parsed;
+    // Restore the response to the full ingredient array. The API returns one
+    // result per submitted string, while recipes may contain blank/header rows.
+    const aligned = (recipe.recipeIngredient || []).map(() => null);
+    inputIndexes.forEach((recipeIndex, parsedIndex) => {
+      aligned[recipeIndex] = parsed[parsedIndex] || null;
+    });
+    return aligned;
   };
 
   const buildUpdated = (recipe, parsed) =>
@@ -986,11 +1021,7 @@ function ParserSection({ api, addLog }) {
 
   const saveRecipe = async (recipe, updatedIngredients) => {
     await api.patch(`/recipes/${recipe.slug}`, {
-      recipeIngredient: updatedIngredients.map(ing => ({
-        ...ing,
-        food: ing.food ? { id: ing.food.id, name: ing.food.name } : null,
-        unit: ing.unit ? { id: ing.unit.id, name: ing.unit.name } : null,
-      })),
+      recipeIngredient: updatedIngredients.map(ingredientForSave),
     });
   };
 
@@ -999,7 +1030,7 @@ function ParserSection({ api, addLog }) {
     setRunning(true); setLogs([]); setProgress({ done: 0, total: 0 });
     setReviewItems([]);
 
-    addParserLog("info", `Starting parse (${parser} engine, ${reviewMode ? "review mode" : "auto-save"})…`);
+    addParserLog("info", `Starting parse (${parserEngine} engine, ${reviewMode ? "review mode" : "auto-save"})…`);
 
     try {
       const allRecipes = await getAllRecipes();
@@ -1260,13 +1291,11 @@ function ParserSection({ api, addLog }) {
               ))}
             </div>
           </div>
-          <div style={{ minWidth: 160 }}>
+          <div style={{ minWidth: 180 }}>
             <label style={{ fontSize: 11, color: C.muted, display: "block", marginBottom: 6, textTransform: "uppercase", letterSpacing: ".06em" }}>Parser Engine</label>
-            <select value={parser} onChange={e => setParser(e.target.value)}>
-              <option value="nlp">NLP (default)</option>
-              <option value="brute">Brute Force</option>
-              <option value="openai">OpenAI</option>
-            </select>
+            <div className="tag tag-blue" style={{ display: "inline-block", padding: "8px 12px" }}>
+              {{ nlp: "NLP", brute: "Brute Force", openai: "AI" }[parserEngine] || "NLP"} · configured in Admin
+            </div>
           </div>
           <div style={{ minWidth: 140 }}>
             <label style={{ fontSize: 11, color: C.muted, display: "block", marginBottom: 6, textTransform: "uppercase", letterSpacing: ".06em" }}>Batch Size</label>
@@ -1752,7 +1781,8 @@ function CookbooksSection({ api, addLog, cache, onCache, aiConfig }) {
   const selectCookbook = async (cb) => {
     setSelected(cb);
     try {
-      const params = new URLSearchParams({ cookBooks: cb.id, perPage: 100 });
+      // Mealie's recipe filter is singular `cookbook` (not `cookBooks`).
+      const params = new URLSearchParams({ cookbook: cb.id, perPage: 100 });
       const r = await api.get(`/recipes?${params}`);
       setCbRecipes(r.items || []);
     } catch { setCbRecipes([]); }
@@ -1769,10 +1799,12 @@ function CookbooksSection({ api, addLog, cache, onCache, aiConfig }) {
   };
 
   const createCookbook = async () => {
+    const name = newName.trim();
+    if (!name) return;
     setSaving(true);
     try {
-      await api.post("/households/cookbooks", { name: newName, description: newDesc, public: false });
-      addLog("ok", `Created: ${newName}`);
+      await api.post("/households/cookbooks", { name, description: newDesc.trim(), public: false });
+      addLog("ok", `Created: ${name}`);
       setNewName(""); setNewDesc(""); setCreating(false);
       load();
     } catch (e) { addLog("error", e.message); }
@@ -1797,9 +1829,14 @@ function CookbooksSection({ api, addLog, cache, onCache, aiConfig }) {
       });
       const data = await res.json();
       if (!res.ok) throw new Error(data.error || "Unknown error");
-      setAiResults(data.suggestions);
+      // Some providers return the requested array wrapped in one extra array.
+      // Normalize it before rendering/reviewing so suggestions have .name and
+      // .recipeNames at the expected level.
+      const suggestions = normalizeAiSuggestions(data.suggestions);
+      if (!suggestions.length) throw new Error("AI returned no usable cookbook suggestions");
+      setAiResults(suggestions);
       setAiModel(data.model || "");
-      addLog("ok", `AI suggested ${data.suggestions.length} cookbooks via ${data.model}`);
+      addLog("ok", `AI suggested ${suggestions.length} cookbooks via ${data.model}`);
     } catch (e) {
       setAiError(e.message);
       addLog("error", `AI error: ${e.message}`);
@@ -2305,6 +2342,15 @@ export default function App() {
   const [householdCache, setHouseholdCache] = useState(null);
   const [taxonomyCache, setTaxonomyCache] = useState(null);
   const [cookbooksCache, setCookbooksCache] = useState(null);
+  const [parserEngine, setParserEngine] = useState(() => {
+    try { return localStorage.getItem("mpt_parser_engine") || "nlp"; }
+    catch { return "nlp"; }
+  });
+  const saveParserEngine = (engine) => {
+    const value = ["nlp", "brute", "openai"].includes(engine) ? engine : "nlp";
+    setParserEngine(value);
+    try { localStorage.setItem("mpt_parser_engine", value); } catch {}
+  };
   // Global AI config — set in Admin, read by Cookbooks and Tags & Cats
   const [aiConfig, setAiConfig] = useState(() => {
     try {
@@ -2473,16 +2519,16 @@ export default function App() {
           {/* Content */}
           <div className="fade-up">
             {tab === "dashboard"  && <DashboardSection  api={conn.api} user={conn.user} addLog={addLog} onNavigate={setTab} />}
-            {tab === "recipes"    && <RecipesSection    api={conn.api} addLog={addLog} cache={recipeCache} onCache={setRecipeCache} />}
-            {tab === "parser"     && <ParserSection     api={conn.api} addLog={addLog} />}
+            {tab === "recipes"    && <RecipesSection    api={conn.api} addLog={addLog} cache={recipeCache} onCache={setRecipeCache} parserEngine={parserEngine} />}
+            {tab === "parser"     && <ParserSection     api={conn.api} addLog={addLog} parserEngine={parserEngine} />}
             {tab === "bulk"       && <BulkSection       api={conn.api} addLog={addLog} aiConfig={aiConfig} />}
             {tab === "taxonomy"   && <TaxonomySection   api={conn.api} addLog={addLog} cache={taxonomyCache} onCache={setTaxonomyCache} aiConfig={aiConfig} />}
             {tab === "cookbooks"  && <CookbooksSection  api={conn.api} addLog={addLog} cache={cookbooksCache} onCache={setCookbooksCache} aiConfig={aiConfig} />}
-            {tab === "quality"    && <DataQualitySection api={conn.api} addLog={addLog} savedResults={qualityResults} onSaveResults={setQualityResults} />}
+            {tab === "quality"    && <DataQualitySection api={conn.api} addLog={addLog} savedResults={qualityResults} onSaveResults={setQualityResults} parserEngine={parserEngine} />}
             {tab === "images"     && <ImageSection      api={conn.api} addLog={addLog} />}
             {tab === "activity"   && <ActivitySection   api={conn.api} addLog={addLog} />}
             {tab === "households" && <HouseholdsSection api={conn.api} addLog={addLog} cache={householdCache} onCache={setHouseholdCache} />}
-            {tab === "admin"      && <AdminSection      api={conn.api} addLog={addLog} aiConfig={aiConfig} onSaveAiConfig={saveAiConfig} />}
+            {tab === "admin"      && <AdminSection      api={conn.api} addLog={addLog} aiConfig={aiConfig} onSaveAiConfig={saveAiConfig} parserEngine={parserEngine} onSaveParserEngine={saveParserEngine} />}
           </div>
 
           {/* Global log footer */}
@@ -2611,8 +2657,11 @@ function BulkSection({ api, addLog, aiConfig }) {
       });
       const data = await res.json();
       if (!res.ok) throw new Error(data.error);
-      setAiResults(data.suggestions);
-      setAiSelected(new Set(data.suggestions.map((_, i) => i)));
+      const suggestions = normalizeAiSuggestions(data.suggestions);
+      if (!suggestions.length) throw new Error("AI returned no usable tag/category suggestions");
+      setAiResults(suggestions);
+      setAiSelected(new Set(suggestions.map((_, i) => i)));
+      addLog("ok", `AI suggested ${suggestions.length} ${aiType}`);
     } catch (e) { setAiError(e.message); }
     setAiLoading(false);
   };
@@ -2935,11 +2984,13 @@ function TaxonomySection({ api, addLog, cache, onCache, aiConfig }) {
       });
       const data = await res.json();
       if (!res.ok) throw new Error(data.error || "Unknown error");
-      setAiResults(data.suggestions);
+      const suggestions = normalizeAiSuggestions(data.suggestions);
+      if (!suggestions.length) throw new Error("AI returned no usable tag/category suggestions");
+      setAiResults(suggestions);
       // Pre-select all suggestions
-      setSelected(new Set(data.suggestions.map((_, i) => i)));
+      setSelected(new Set(suggestions.map((_, i) => i)));
       setAiModel(data.model || "");
-      addLog("ok", `AI suggested ${data.suggestions.length} ${activeType}`);
+      addLog("ok", `AI suggested ${suggestions.length} ${activeType}`);
     } catch (e) {
       setAiError(e.message);
       addLog("error", `AI error: ${e.message}`);
@@ -3210,7 +3261,7 @@ function TaxonomySection({ api, addLog, cache, onCache, aiConfig }) {
 
 
 // ─── SECTION: Data Quality ─────────────────────────────────────────────────────
-function DataQualitySection({ api, addLog, savedResults, onSaveResults }) {
+function DataQualitySection({ api, addLog, savedResults, onSaveResults, parserEngine }) {
   const [loading, setLoading] = useState(false);
   const [results, setResults] = useState(savedResults || null);
   const [checking, setChecking] = useState("");
@@ -3304,27 +3355,32 @@ function DataQualitySection({ api, addLog, savedResults, onSaveResults }) {
             repipeNote: "Assign tags via the Bulk Operations tab" },
           { key: "unparsed",       label: "Parsed Ingredients", bad: results.unparsed,     icon: "⚡",
             repair: async (r) => {
+              const inputIndexes = [];
               const ings = (r.recipeIngredient || [])
-                .filter(i => i.display || i.note)
-                .map(i => i.display || i.note || "");
+                .map((i, index) => {
+                  if (!i.display && !i.note) return null;
+                  inputIndexes.push(index);
+                  return i.display || i.note || "";
+                })
+                .filter(Boolean);
               if (!ings.length) return;
               const parsed = await api.post("/parser/ingredients", {
                 ingredients: ings,
-                parser: "nlp"
+                parser: parserEngine
               });
-              const updated = r.recipeIngredient.map((ing, idx) => ({
-                ...ing, ...(parsed[idx] ? {
-                  food: parsed[idx].ingredient?.food,
-                  unit: parsed[idx].ingredient?.unit,
-                  quantity: parsed[idx].ingredient?.quantity,
-                } : {})
-              }));
+              const updated = r.recipeIngredient.map((ing, idx) => {
+                const parsedIndex = inputIndexes.indexOf(idx);
+                const parsedIngredient = parsedIndex >= 0 ? parsed[parsedIndex] : null;
+                return {
+                  ...ing, ...(parsedIngredient ? {
+                    food: parsedIngredient.ingredient?.food,
+                    unit: parsedIngredient.ingredient?.unit,
+                    quantity: parsedIngredient.ingredient?.quantity,
+                  } : {})
+                };
+              });
               await api.patch(`/recipes/${r.slug}`, {
-                recipeIngredient: updated.map(ing => ({
-                  ...ing,
-                  food: ing.food ? { id: ing.food.id, name: ing.food.name } : null,
-                  unit: ing.unit ? { id: ing.unit.id, name: ing.unit.name } : null,
-                }))
+                recipeIngredient: updated.map(ingredientForSave)
               });
               addLog("ok", `Parsed: ${r.name}`);
             }
@@ -3474,7 +3530,7 @@ function DataQualitySection({ api, addLog, savedResults, onSaveResults }) {
 
 
 // ─── SECTION: Admin ────────────────────────────────────────────────────────────
-function AdminSection({ api, addLog, aiConfig, onSaveAiConfig }) {
+function AdminSection({ api, addLog, aiConfig, onSaveAiConfig, parserEngine, onSaveParserEngine }) {
   const [activeTab, setActiveTab] = useState("users");
   const [users, setUsers] = useState([]);
   const [loading, setLoading] = useState(true);
@@ -3544,7 +3600,7 @@ function AdminSection({ api, addLog, aiConfig, onSaveAiConfig }) {
     setBackupRunning(true);
     try {
       addLog("info", "Triggering backup…");
-      await api.post("/admin/backups/export/run", {});
+      await api.post("/admin/backups", {});
       addLog("ok", "Backup created successfully");
     } catch (e) { addLog("error", `Backup failed: ${e.message}`); }
     setBackupRunning(false);
@@ -3666,6 +3722,21 @@ function AdminSection({ api, addLog, aiConfig, onSaveAiConfig }) {
       {/* AI Settings tab */}
       {activeTab === "ai" && (
         <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
+          <div className="card">
+            <div style={{ fontWeight: 600, marginBottom: 8 }}>Ingredient Parser</div>
+            <div style={{ fontSize: 12, color: C.muted, marginBottom: 12, lineHeight: 1.5 }}>
+              Select the parser used by the bulk ingredient parser, recipe-level parser buttons, and data-quality repairs.
+            </div>
+            <select value={parserEngine} onChange={e => {
+              onSaveParserEngine(e.target.value);
+              addLog("ok", `Ingredient parser set to ${e.target.value}`);
+            }} style={{ maxWidth: 260 }}>
+              <option value="nlp">NLP</option>
+              <option value="brute">Brute Force</option>
+              <option value="openai">AI</option>
+            </select>
+          </div>
+
           {/* Detected provider info */}
           <div className="card">
             <div style={{ fontWeight: 600, marginBottom: 12 }}>Mealie AI Provider</div>
@@ -3872,7 +3943,7 @@ function ImageSection({ api, addLog }) {
     if (!url) return;
     setFetching(f => ({ ...f, [slug]: true }));
     try {
-      await api.post(`/recipes/${slug}/image`, { url, fileName: "original" });
+      await api.post(`/recipes/${slug}/image`, { url });
       addLog("ok", `Image set for: ${slug}`);
       setRecipes(r => r.map(x => x.slug === slug ? { ...x, image: url } : x));
       setFetchUrl(f => ({ ...f, [slug]: "" }));
@@ -3884,21 +3955,24 @@ function ImageSection({ api, addLog }) {
     if (!file) return;
     setFetching(f => ({ ...f, [slug]: true }));
     try {
-      // Read file as base64 data URL then post as multipart
+      // Mealie's file upload endpoint requires multipart PUT.
       const formData = new FormData();
       formData.append("image", file);
       formData.append("extension", file.name.split(".").pop());
       // Use fetch directly with FormData (our api helper sets Content-Type: application/json)
-      const mealieUrl = document.cookie; // not used — we grab from header
       const r = await fetch(`/api/recipes/${slug}/image`, {
-        method: "POST",
+        method: "PUT",
         headers: {
           "X-Mealie-Url": api._base,
           "Authorization": `Bearer ${api._token}`,
         },
         body: formData,
       });
-      if (!r.ok) throw new Error(`${r.status} ${r.statusText}`);
+      if (!r.ok) {
+        const body = await r.json().catch(() => null);
+        const detail = typeof body?.detail === "string" ? body.detail : body?.detail?.message || body?.message;
+        throw new Error(`${r.status} ${r.statusText}${detail ? `: ${detail}` : ""}`);
+      }
       addLog("ok", `Image uploaded for: ${slug}`);
       setRecipes(rs => rs.map(x => x.slug === slug ? { ...x, image: file.name } : x));
     } catch (e) { addLog("error", `Upload failed for ${slug}: ${e.message}`); }
@@ -4016,17 +4090,37 @@ function ActivitySection({ api, addLog }) {
   const [sort, setSort] = useState("dateUpdated");
   const [tableSort, setTableSort] = useState({ field: "dateUpdated", dir: "desc" });
   const [nameFilter, setNameFilter] = useState("");
+  const [error, setError] = useState("");
 
   useEffect(() => {
+    let cancelled = false;
     (async () => {
       setLoading(true);
+      setError("");
       try {
-        const d = await api.get(`/recipes?page=1&perPage=50&orderBy=${sort}&orderDirection=desc`);
-        setRecipes(d.items || []);
-      } catch (e) { addLog("error", e.message); }
-      setLoading(false);
+        // Keep ordering client-side. Mealie versions differ in which recipe
+        // summary fields are accepted by the pagination orderBy parameter.
+        const all = [];
+        let page = 1;
+        while (true) {
+          const d = await api.get(`/recipes?page=${page}&perPage=100`);
+          const items = d.items || [];
+          all.push(...items);
+          if (!items.length || all.length >= (d.total ?? all.length)) break;
+          page += 1;
+        }
+        if (!cancelled) setRecipes(all);
+      } catch (e) {
+        if (!cancelled) {
+          setError(e.message);
+          addLog("error", e.message);
+        }
+      } finally {
+        if (!cancelled) setLoading(false);
+      }
     })();
-  }, [api, sort]);
+    return () => { cancelled = true; };
+  }, [api, addLog]);
 
   const fmt = (dt) => {
     if (!dt) return "—";
@@ -4042,6 +4136,7 @@ function ActivitySection({ api, addLog }) {
     const nowDate  = new Date(now.getFullYear(),  now.getMonth(),  now.getDate());
     const thenDate = new Date(then.getFullYear(), then.getMonth(), then.getDate());
     const days = Math.round((nowDate - thenDate) / 86400000);
+    if (days < 0) return "Upcoming";
     if (days === 0) return "Today";
     if (days === 1) return "Yesterday";
     if (days < 7) return `${days} days ago`;
@@ -4054,7 +4149,7 @@ function ActivitySection({ api, addLog }) {
       <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
         <span style={{ fontSize: 13, color: C.muted }}>Sort by:</span>
         {[["dateUpdated", "Last Modified"], ["dateAdded", "Date Added"], ["lastMade", "Last Cooked"]].map(([v, l]) => (
-          <button key={v} onClick={() => setSort(v)} style={{
+          <button key={v} onClick={() => { setSort(v); setTableSort({ field: v, dir: "desc" }); }} style={{
             padding: "6px 14px", borderRadius: 8, border: `2px solid`,
             borderColor: sort === v ? C.accent : C.border,
             background: sort === v ? `${C.accent}18` : C.surfaceAlt,
@@ -4065,13 +4160,21 @@ function ActivitySection({ api, addLog }) {
       </div>
 
       {loading ? <div style={{ textAlign: "center", padding: 60 }}><Spinner size={32} /></div> : (() => {
-        let rows = recipes.filter(r => !nameFilter || r.name.toLowerCase().includes(nameFilter.toLowerCase()));
+        let rows = recipes.filter(r => !nameFilter || (r.name || "").toLowerCase().includes(nameFilter.toLowerCase()));
         rows = [...rows].sort((a, b) => {
-          const av = a[tableSort.field] ? new Date(a[tableSort.field]).getTime() : 0;
-          const bv = b[tableSort.field] ? new Date(b[tableSort.field]).getTime() : 0;
-          return tableSort.dir === "asc" ? av - bv : bv - av;
+          if (tableSort.field === "name") {
+            const cmp = (a.name || "").localeCompare(b.name || "", undefined, { sensitivity: "base" });
+            return tableSort.dir === "asc" ? cmp : -cmp;
+          }
+          const av = a[tableSort.field] ? Date.parse(a[tableSort.field]) : Number.NEGATIVE_INFINITY;
+          const bv = b[tableSort.field] ? Date.parse(b[tableSort.field]) : Number.NEGATIVE_INFINITY;
+          const safeAv = Number.isNaN(av) ? Number.NEGATIVE_INFINITY : av;
+          const safeBv = Number.isNaN(bv) ? Number.NEGATIVE_INFINITY : bv;
+          return tableSort.dir === "asc" ? safeAv - safeBv : safeBv - safeAv;
         });
         return (
+        <>
+        {error && <div className="card" style={{ color: C.red, padding: 16 }}>{error}</div>}
         <div className="card" style={{ padding: 0, overflow: "hidden" }}>
           <table>
             <thead>
@@ -4083,6 +4186,9 @@ function ActivitySection({ api, addLog }) {
               </tr>
             </thead>
             <tbody>
+              {!rows.length && <tr><td colSpan={4} style={{ textAlign: "center", color: C.muted, padding: 40 }}>
+                {error ? "Unable to load activity." : "No recipes found."}
+              </td></tr>}
               {rows.map(r => (
                 <tr key={r.id}>
                   <td>
@@ -4106,6 +4212,7 @@ function ActivitySection({ api, addLog }) {
             </tbody>
           </table>
         </div>
+        </>
       )}
       )}
       </div>
