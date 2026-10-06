@@ -135,7 +135,7 @@ docker run -d --name mealie-powertools --restart unless-stopped -p 3000:3000 \
 ## Tested With
 
 - Mealie v3.27.0
-- Docker 24+
+- Docker 24+ (AMD64 and ARM64 images are published)
 
 ---
 
