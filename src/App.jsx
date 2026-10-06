@@ -263,6 +263,21 @@ const ingredientForSave = (ing) => ({
 const ingredientInputText = (ing) => ing.originalText?.trim() || ing.display?.trim() || ing.note?.trim()
   || [ing.quantity, ing.unit?.name, ing.food?.name].filter(Boolean).join(" ");
 
+const ingredientNeedsFoodReview = (ing) =>
+  !ing.title && ingredientInputText(ing) && (!ing.food || !ing.food.id);
+
+const slugifyTaxonomyName = (name) => String(name || "")
+  .trim()
+  .toLowerCase()
+  .replace(/[^a-z0-9]+/g, "-")
+  .replace(/^-+|-+$/g, "");
+
+const taxonomyForSave = (item) => item && ({
+  id: item.id,
+  name: item.name,
+  slug: item.slug || slugifyTaxonomyName(item.name),
+});
+
 // Mealie cookbooks are saved searches, not a recipe-to-cookbook join table.
 // An explicit selection must therefore be represented by an id filter.
 const recipeIdFilter = (ids) => {
@@ -545,6 +560,7 @@ function RecipesSection({ api, addLog, cache, onCache, parserEngine }) {
   const [editFull, setEditFull] = useState(null);
   const [saving, setSaving] = useState(false);
   const [parsingSlug, setParsingSlug] = useState(null);
+  const [parseReview, setParseReview] = useState(null);
   const [tableSort, setTableSort] = useState({ field: "name", dir: "asc" });
   const [colFilters, setColFilters] = useState({});
   const fmtDate = (dt) => dt ? new Date(dt).toLocaleDateString("en-US", { month: "short", day: "numeric", year: "numeric" }) : "—";
@@ -629,10 +645,115 @@ function RecipesSection({ api, addLog, cache, onCache, parserEngine }) {
     return { ...(current?.id && current.name === name ? { id: current.id } : {}), name };
   };
 
+  const updateParseReviewIngredient = (index, changes) => {
+    setParseReview(review => review && ({
+      ...review,
+      ingredients: review.ingredients.map((ing, i) => i === index
+        ? { ...ing, ...changes, display: "" }
+        : ing),
+    }));
+  };
+
+  const createParseReviewRelation = async (index, kind) => {
+    const relation = parseReview?.ingredients[index]?.[kind];
+    const name = relation?.name?.trim();
+    if (!name) return;
+    try {
+      const created = await api.post(kind === "food" ? "/foods" : "/units", { name });
+      updateParseReviewIngredient(index, { [kind]: created });
+      addLog("ok", `Created ${kind}: ${name}`);
+    } catch (e) { addLog("error", `Could not create ${kind} "${name}": ${e.message}`); }
+  };
+
+  const saveParseReview = async () => {
+    if (!parseReview) return;
+    const unresolved = parseReview.ingredients.filter(ingredientNeedsFoodReview);
+    if (unresolved.length) {
+      addLog("warn", `${parseReview.recipe.name}: confirm or create ${unresolved.length} missing Food(s) before saving`);
+      return;
+    }
+    setSaving(true);
+    try {
+      await api.patch(`/recipes/${parseReview.recipe.slug}`, {
+        recipeIngredient: parseReview.ingredients.map(ingredientForSave),
+      });
+      addLog("ok", `Parsed: ${parseReview.recipe.name}`);
+      setParseReview(null);
+      load(page, search);
+    } catch (e) { addLog("error", e.message); }
+    setSaving(false);
+  };
+
   const pages = Math.ceil(total / PER);
 
   return (
     <div style={{ display: "flex", flexDirection: "column", gap: 20 }}>
+      {parseReview && (
+        <div style={{
+          position: "fixed", inset: 0, background: "#000c", zIndex: 110,
+          display: "flex", alignItems: "center", justifyContent: "center", padding: 20,
+        }}>
+          <div className="card fade-up" style={{ width: "min(1200px, 96vw)", maxHeight: "90vh", overflow: "auto", padding: 0 }}>
+            <div style={{ padding: "16px 20px", borderBottom: `1px solid ${C.border}`, display: "flex", justifyContent: "space-between", alignItems: "center", gap: 12 }}>
+              <div>
+                <div style={{ fontWeight: 700, fontSize: 16 }}>Review Parse Results</div>
+                <div style={{ color: C.muted, fontSize: 12, marginTop: 4 }}>{parseReview.recipe.name} · Nothing will be saved until confirmed</div>
+              </div>
+              <button className="btn-ghost" onClick={() => setParseReview(null)}>Cancel</button>
+            </div>
+            <div style={{ overflowX: "auto" }}>
+              <table>
+                <thead><tr>
+                  <th>Original</th><th>Food</th><th>Unit</th><th>Quantity</th><th>Notes</th><th>Status</th>
+                </tr></thead>
+                <tbody>
+                  {parseReview.ingredients.map((ing, index) => {
+                    const foodMissing = !!ing.food && !ing.food.id;
+                    const unitMissing = !!ing.unit && !ing.unit.id;
+                    const unresolved = ingredientNeedsFoodReview(ing) || unitMissing;
+                    return (
+                      <tr key={ing.referenceId || index}>
+                        <td style={{ fontSize: 12, minWidth: 190 }}>{ingredientInputText(ing) || ing.title || "—"}</td>
+                        <td style={{ minWidth: 220 }}>
+                          {ing.title ? <span className="tag tag-blue">{ing.title}</span> : <>
+                            <input value={ing.food?.name || ""} placeholder="Food"
+                              onChange={e => updateParseReviewIngredient(index, { food: editedRelation(ing.food, e.target.value) })} />
+                            {foodMissing && <button className="btn-ghost" style={{ fontSize: 10, padding: "3px 7px", marginTop: 4 }} onClick={() => createParseReviewRelation(index, "food")}>Create Food</button>}
+                          </>}
+                        </td>
+                        <td style={{ minWidth: 150 }}>
+                          {!ing.title && <>
+                            <input value={ing.unit?.name || ""} placeholder="Unit"
+                              onChange={e => updateParseReviewIngredient(index, { unit: editedRelation(ing.unit, e.target.value) })} />
+                            {unitMissing && <button className="btn-ghost" style={{ fontSize: 10, padding: "3px 7px", marginTop: 4 }} onClick={() => createParseReviewRelation(index, "unit")}>Create Unit</button>}
+                          </>}
+                        </td>
+                        <td style={{ minWidth: 90 }}>
+                          {!ing.title && <input type="number" step="any" min="0" value={ing.quantity ?? ""}
+                            onChange={e => updateParseReviewIngredient(index, { quantity: e.target.value === "" ? null : Number(e.target.value) })} />}
+                        </td>
+                        <td style={{ minWidth: 220 }}>
+                          {!ing.title && <input value={ing.note || ""} placeholder="Notes"
+                            onChange={e => updateParseReviewIngredient(index, { note: e.target.value })} />}
+                        </td>
+                        <td>
+                          {unresolved ? <span className="tag tag-yellow">Needs confirmation</span> : <span className="tag tag-green">Ready</span>}
+                        </td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            </div>
+            <div style={{ padding: 16, borderTop: `1px solid ${C.border}`, display: "flex", justifyContent: "flex-end", gap: 10 }}>
+              <button className="btn-ghost" onClick={() => setParseReview(null)}>Cancel</button>
+              <button className="btn-primary" onClick={saveParseReview} disabled={saving}>
+                {saving ? <Spinner size={13} /> : "Confirm and Save"}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
       <CacheHeader loadedAt={cache?.loadedAt} loading={loading} label="Recipes" onReload={() => load(page, search)} />
       <div style={{ display: "flex", gap: 10, alignItems: "center" }}>
         <div style={{ position: "relative", flex: 1 }}>
@@ -742,16 +863,12 @@ function RecipesSection({ api, addLog, cache, onCache, parserEngine }) {
                                     unit: parsedIngredient.ingredient?.unit,
                                     quantity: parsedIngredient.ingredient?.quantity,
                                     note: parsedIngredient.ingredient?.note || "",
-                                    originalText: ing.originalText,
+                                    originalText: ing.originalText || ing.display || null,
                                     display: "",
                                   } : {})
                                 };
                               });
-                              await api.patch(`/recipes/${r.slug}`, {
-                                recipeIngredient: updated.map(ingredientForSave)
-                              });
-                              addLog("ok", `Parsed: ${r.name}`);
-                              load(page, search);
+                              setParseReview({ recipe: full, ingredients: updated });
                             }
                           } catch(e) { addLog("error", e.message); }
                           setParsingSlug(null);
@@ -1103,12 +1220,16 @@ function ParserSection({ api, addLog, parserEngine }) {
           ? parsed[idx].ingredient?.quantity
           : null,
         note: parsed[idx].ingredient?.note || "",
-        originalText: ing.originalText,
+        originalText: ing.originalText || ing.display || null,
         display: "",
       } : {}),
     }));
 
   const saveRecipe = async (recipe, updatedIngredients) => {
+    const unresolved = updatedIngredients.filter(ingredientNeedsFoodReview);
+    if (unresolved.length) {
+      throw new Error(`${recipe.name}: ${unresolved.length} ingredient(s) still need a confirmed Food. Use review mode to select or create it.`);
+    }
     await api.patch(`/recipes/${recipe.slug}`, {
       recipeIngredient: updatedIngredients.map(ingredientForSave),
     });
@@ -2786,7 +2907,7 @@ function BulkSection({ api, addLog, aiConfig }) {
           const full = await api.get(`/recipes/${slug}`);
           const existing = full.tags || [];
           if (!existing.find(t => t.id === assignTag)) {
-            await api.patch(`/recipes/${slug}`, { tags: [...existing, { id: tag.id, name: tag.name }] });
+            await api.patch(`/recipes/${slug}`, { tags: [...existing.map(taxonomyForSave), taxonomyForSave(tag)] });
           }
         }
         addLog("ok", `Tag "${tag?.name}" assigned to ${slugs.length} recipes`);
@@ -2796,7 +2917,7 @@ function BulkSection({ api, addLog, aiConfig }) {
           const full = await api.get(`/recipes/${slug}`);
           const existing = full.recipeCategory || [];
           if (!existing.find(c => c.id === assignCat)) {
-            await api.patch(`/recipes/${slug}`, { recipeCategory: [...existing, { id: cat.id, name: cat.name }] });
+            await api.patch(`/recipes/${slug}`, { recipeCategory: [...existing.map(taxonomyForSave), taxonomyForSave(cat)] });
           }
         }
         addLog("ok", `Category "${cat?.name}" assigned to ${slugs.length} recipes`);
@@ -3560,15 +3681,20 @@ function DataQualitySection({ api, addLog, savedResults, onSaveResults, parserEn
                     unit: parsedIngredient.ingredient?.unit,
                     quantity: parsedIngredient.ingredient?.quantity,
                     note: parsedIngredient.ingredient?.note || "",
-                    originalText: ing.originalText,
+                    originalText: ing.originalText || ing.display || null,
                     display: "",
                   } : {})
                 };
               });
-              await api.patch(`/recipes/${r.slug}`, {
-                recipeIngredient: updated.map(ingredientForSave)
-              });
-              addLog("ok", `Parsed: ${r.name}`);
+              const unresolved = updated.filter(ingredientNeedsFoodReview);
+              if (unresolved.length) {
+                addLog("warn", `Skipped: ${r.name} has ${unresolved.length} ingredient(s) that need Food confirmation`);
+              } else {
+                await api.patch(`/recipes/${r.slug}`, {
+                  recipeIngredient: updated.map(ingredientForSave)
+                });
+                addLog("ok", `Parsed: ${r.name}`);
+              }
             }
           },
           { key: "noSource",       label: "Source URL",       bad: results.noSource,       icon: "🔗",  repair: null,
@@ -4285,14 +4411,25 @@ function ActivitySection({ api, addLog }) {
       setError("");
       try {
         // Keep ordering client-side. Mealie versions differ in which recipe
-        // summary fields are accepted by the pagination orderBy parameter.
+        // summary fields are accepted by the pagination orderBy parameter and
+        // may serialize response fields as either camelCase or snake_case.
         const all = [];
         let page = 1;
         while (true) {
           const d = await api.get(`/recipes?page=${page}&perPage=100`);
-          const items = d.items || [];
+          const items = (d.items || []).map(r => ({
+            ...r,
+            dateAdded: r.dateAdded ?? r.date_added,
+            dateUpdated: r.dateUpdated ?? r.date_updated,
+            lastMade: r.lastMade ?? r.last_made,
+            recipeCategory: r.recipeCategory ?? r.recipe_category,
+          }));
           all.push(...items);
-          if (!items.length || all.length >= (d.total ?? all.length)) break;
+          const total = d.total ?? d.total_count;
+          const totalPages = d.totalPages ?? d.total_pages;
+          const hasNextPage = d.next || (totalPages && page < totalPages)
+            || (total != null && all.length < total);
+          if (!items.length || !hasNextPage) break;
           page += 1;
         }
         if (!cancelled) setRecipes(all);
