@@ -1,5 +1,5 @@
 const express = require("express");
-const { createProxyMiddleware } = require("http-proxy-middleware");
+const { createProxyMiddleware, fixRequestBody } = require("http-proxy-middleware");
 const path = require("path");
 
 const app = express();
@@ -13,6 +13,9 @@ function getProxy(target) {
       target,
       changeOrigin: true,
       on: {
+        // express.json() consumes the incoming request stream before the proxy
+        // sees it. Re-serialize req.body so POST/PATCH/PUT bodies reach Mealie.
+        proxyReq: fixRequestBody,
         error: (err, req, res) => {
           console.error(`[proxy error] ${err.message}`);
           if (!res.headersSent) res.status(502).json({ error: `Proxy error: ${err.message}` });
