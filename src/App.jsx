@@ -1,7 +1,7 @@
 import { Component, useState, useEffect, useCallback, useRef } from "react";
 
 // ─── Version ─────────────────────────────────────────────────────────────────
-const VERSION = "0.2.0";
+const VERSION = "0.2.1";
 
 // ─── Design tokens ───────────────────────────────────────────────────────────
 const C = {
@@ -277,6 +277,33 @@ const taxonomyForSave = (item) => item && ({
   name: item.name,
   slug: item.slug || slugifyTaxonomyName(item.name),
 });
+
+const newClientId = () => {
+  if (globalThis.crypto?.randomUUID) return globalThis.crypto.randomUUID();
+  return `mpt-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+};
+
+const findOrCreateRelation = async (api, kind, name) => {
+  const path = kind === "food" ? "/foods" : "/units";
+  const normalized = name.trim().toLowerCase();
+  const findExisting = async () => {
+    try {
+      const result = await api.get(`${path}?search=${encodeURIComponent(name)}&perPage=100`);
+      return (result.items || []).find(item => item.name?.trim().toLowerCase() === normalized) || null;
+    } catch { return null; }
+  };
+  const existing = await findExisting();
+  if (existing) return existing;
+  try {
+    return await api.post(path, { name: name.trim() });
+  } catch (error) {
+    // A concurrent or already-existing record may be reported as a generic
+    // ValueError by Mealie. Re-query before surfacing the error.
+    const recovered = await findExisting();
+    if (recovered) return recovered;
+    throw error;
+  }
+};
 
 // Mealie cookbooks are saved searches, not a recipe-to-cookbook join table.
 // An explicit selection must therefore be represented by an id filter.
@@ -561,6 +588,8 @@ function RecipesSection({ api, addLog, cache, onCache, parserEngine }) {
   const [saving, setSaving] = useState(false);
   const [parsingSlug, setParsingSlug] = useState(null);
   const [parseReview, setParseReview] = useState(null);
+  const [foodOptions, setFoodOptions] = useState([]);
+  const [unitOptions, setUnitOptions] = useState([]);
   const [tableSort, setTableSort] = useState({ field: "name", dir: "asc" });
   const [colFilters, setColFilters] = useState({});
   const fmtDate = (dt) => dt ? new Date(dt).toLocaleDateString("en-US", { month: "short", day: "numeric", year: "numeric" }) : "—";
@@ -583,17 +612,45 @@ function RecipesSection({ api, addLog, cache, onCache, parserEngine }) {
     setLoading(false);
   }, [api]);
 
+  const updateVisibleRecipe = (slug, changes) => {
+    const next = (recipes || []).map(recipe => recipe.slug === slug
+      ? { ...recipe, ...changes }
+      : recipe);
+    setRecipes(next);
+    onCache({ recipes: next, total, page, search, loadedAt: Date.now() });
+  };
+
   // Parser and editor actions can update recipes from other sections. Refresh
   // whenever this section mounts so the ingredient status is not left stale in
   // the shared cache after a successful parse.
   useEffect(() => { load(page, search); }, [load]);
+
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const [foods, units] = await Promise.all([
+          api.get("/foods?perPage=500"),
+          api.get("/units?perPage=500"),
+        ]);
+        if (!cancelled) {
+          setFoodOptions(foods.items || []);
+          setUnitOptions(units.items || []);
+        }
+      } catch { /* autocomplete is optional; manual entry remains available */ }
+    })();
+    return () => { cancelled = true; };
+  }, [api]);
 
   const del = async (slug, name) => {
     if (!confirm(`Delete "${name}"?`)) return;
     try {
       await api.delete(`/recipes/${slug}`);
       addLog("ok", `Deleted recipe: ${name}`);
-      load(page, search);
+      const next = (recipes || []).filter(recipe => recipe.slug !== slug);
+      setRecipes(next);
+      setTotal(value => Math.max(0, value - 1));
+      onCache({ recipes: next, total: Math.max(0, total - 1), page, search, loadedAt: Date.now() });
     } catch (e) { addLog("error", e.message); }
   };
 
@@ -606,6 +663,47 @@ function RecipesSection({ api, addLog, cache, onCache, parserEngine }) {
   const save = async () => {
     setSaving(true);
     try {
+      let ingredients = editFull.recipeIngredient || [];
+      const parseIndexes = [];
+      const parseInputs = ingredients.map((ing, index) => {
+        if (ing.title || (ing.food?.id && (!ing.unit || ing.unit.id))) return null;
+        const text = [ing.quantity, ing.unit?.name, ing.food?.name, ing.note]
+          .filter(value => value !== null && value !== undefined && String(value).trim())
+          .join(" ");
+        if (!text) return null;
+        parseIndexes.push(index);
+        return text;
+      }).filter(Boolean);
+
+      // New or manually edited ingredients go through Mealie's parser before
+      // saving, so names are matched to the group's Foods and Units.
+      if (parseInputs.length) {
+        const parsed = await api.post("/parser/ingredients", {
+          ingredients: parseInputs,
+          parser: parserEngine,
+        });
+        ingredients = ingredients.map((ing, index) => {
+          const parsedIndex = parseIndexes.indexOf(index);
+          const result = parsedIndex >= 0 ? parsed[parsedIndex]?.ingredient : null;
+          if (!result) return ing;
+          const sourceText = [ing.quantity, ing.unit?.name, ing.food?.name, ing.note]
+            .filter(value => value !== null && value !== undefined && String(value).trim())
+            .join(" ");
+          return {
+            ...ing,
+            food: result.food || ing.food,
+            unit: result.unit || ing.unit,
+            quantity: result.quantity ?? ing.quantity,
+            note: result.note ?? ing.note ?? "",
+            originalText: ing.originalText || sourceText,
+            display: "",
+          };
+        });
+      }
+      const unresolved = ingredients.filter(ingredientNeedsFoodReview);
+      if (unresolved.length) {
+        throw new Error(`${unresolved.length} ingredient(s) need Food confirmation. Select or create a Food before saving.`);
+      }
       await api.patch(`/recipes/${editFull.slug}`, {
         name: editFull.name,
         description: editFull.description,
@@ -616,14 +714,14 @@ function RecipesSection({ api, addLog, cache, onCache, parserEngine }) {
         recipeYield: editFull.recipeYield,
         orgURL: editFull.orgURL,
         rating: editFull.rating,
-        recipeIngredient: (editFull.recipeIngredient || []).map(ingredientForSave),
+        recipeIngredient: ingredients.map(ingredientForSave),
         recipeInstructions: editFull.recipeInstructions,
         notes: editFull.notes,
       });
       addLog("ok", `Updated: ${editFull.name}`);
+      updateVisibleRecipe(editFull.slug, { ...editFull, recipeIngredient: ingredients });
       setEditRecipe(null);
       setEditFull(null);
-      load(page, search);
     } catch (e) { addLog("error", e.message); }
     setSaving(false);
   };
@@ -644,6 +742,10 @@ function RecipesSection({ api, addLog, cache, onCache, parserEngine }) {
     if (!name) return null;
     return { ...(current?.id && current.name === name ? { id: current.id } : {}), name };
   };
+  const relationFromOptions = (current, value, options) => {
+    const exact = options.find(option => option.name?.trim().toLowerCase() === value.trim().toLowerCase());
+    return exact || editedRelation(current, value);
+  };
 
   const updateParseReviewIngredient = (index, changes) => {
     setParseReview(review => review && ({
@@ -659,7 +761,7 @@ function RecipesSection({ api, addLog, cache, onCache, parserEngine }) {
     const name = relation?.name?.trim();
     if (!name) return;
     try {
-      const created = await api.post(kind === "food" ? "/foods" : "/units", { name });
+      const created = await findOrCreateRelation(api, kind, name);
       updateParseReviewIngredient(index, { [kind]: created });
       addLog("ok", `Created ${kind}: ${name}`);
     } catch (e) { addLog("error", `Could not create ${kind} "${name}": ${e.message}`); }
@@ -678,8 +780,8 @@ function RecipesSection({ api, addLog, cache, onCache, parserEngine }) {
         recipeIngredient: parseReview.ingredients.map(ingredientForSave),
       });
       addLog("ok", `Parsed: ${parseReview.recipe.name}`);
+      updateVisibleRecipe(parseReview.recipe.slug, { recipeIngredient: parseReview.ingredients });
       setParseReview(null);
-      load(page, search);
     } catch (e) { addLog("error", e.message); }
     setSaving(false);
   };
@@ -717,14 +819,16 @@ function RecipesSection({ api, addLog, cache, onCache, parserEngine }) {
                         <td style={{ minWidth: 220 }}>
                           {ing.title ? <span className="tag tag-blue">{ing.title}</span> : <>
                             <input value={ing.food?.name || ""} placeholder="Food"
-                              onChange={e => updateParseReviewIngredient(index, { food: editedRelation(ing.food, e.target.value) })} />
+                              list="mpt-parse-foods"
+                              onChange={e => updateParseReviewIngredient(index, { food: relationFromOptions(ing.food, e.target.value, foodOptions) })} />
                             {foodMissing && <button className="btn-ghost" style={{ fontSize: 10, padding: "3px 7px", marginTop: 4 }} onClick={() => createParseReviewRelation(index, "food")}>Create Food</button>}
                           </>}
                         </td>
                         <td style={{ minWidth: 150 }}>
                           {!ing.title && <>
                             <input value={ing.unit?.name || ""} placeholder="Unit"
-                              onChange={e => updateParseReviewIngredient(index, { unit: editedRelation(ing.unit, e.target.value) })} />
+                              list="mpt-parse-units"
+                              onChange={e => updateParseReviewIngredient(index, { unit: relationFromOptions(ing.unit, e.target.value, unitOptions) })} />
                             {unitMissing && <button className="btn-ghost" style={{ fontSize: 10, padding: "3px 7px", marginTop: 4 }} onClick={() => createParseReviewRelation(index, "unit")}>Create Unit</button>}
                           </>}
                         </td>
@@ -745,6 +849,12 @@ function RecipesSection({ api, addLog, cache, onCache, parserEngine }) {
                 </tbody>
               </table>
             </div>
+            <datalist id="mpt-parse-foods">
+              {foodOptions.map(food => <option key={food.id} value={food.name} />)}
+            </datalist>
+            <datalist id="mpt-parse-units">
+              {unitOptions.map(unit => <option key={unit.id} value={unit.name} />)}
+            </datalist>
             <div style={{ padding: 16, borderTop: `1px solid ${C.border}`, display: "flex", justifyContent: "flex-end", gap: 10 }}>
               <button className="btn-ghost" onClick={() => setParseReview(null)}>Cancel</button>
               <button className="btn-primary" onClick={saveParseReview} disabled={saving}>
@@ -983,10 +1093,10 @@ function RecipesSection({ api, addLog, cache, onCache, parserEngine }) {
                     </label>
                     <div style={{ display: "flex", gap: 6 }}>
                       <button className="btn-ghost" style={{ fontSize: 11, padding: "3px 10px" }} onClick={() =>
-                        setField("recipeIngredient", [...(editFull.recipeIngredient || []), { note: "", display: "", quantity: null, unit: null, food: null, substitutions: [], title: "", referenceId: crypto.randomUUID() }])
+                        setField("recipeIngredient", [...(editFull.recipeIngredient || []), { note: "", display: "", quantity: null, unit: null, food: null, substitutions: [], title: "", referenceId: newClientId() }])
                       }>+ Ingredient</button>
                       <button className="btn-ghost" style={{ fontSize: 11, padding: "3px 10px", color: C.blue, borderColor: C.blue + "66" }} onClick={() =>
-                        setField("recipeIngredient", [...(editFull.recipeIngredient || []), { note: "", display: "", quantity: null, unit: null, food: null, title: "Section Header", isHeader: true, referenceId: crypto.randomUUID() }])
+                        setField("recipeIngredient", [...(editFull.recipeIngredient || []), { note: "", display: "", quantity: null, unit: null, food: null, title: "Section Header", isHeader: true, referenceId: newClientId() }])
                       }>+ Header</button>
                     </div>
                   </div>
@@ -1018,12 +1128,12 @@ function RecipesSection({ api, addLog, cache, onCache, parserEngine }) {
                             <input style={{ width: 72 }} type="number" step="any" min="0" placeholder="Qty"
                               value={ing.quantity ?? ""}
                               onChange={e => updateIngredient(idx, { quantity: e.target.value === "" ? null : Number(e.target.value) })} />
-                            <input style={{ width: 125 }} placeholder="Unit"
+                            <input style={{ width: 125 }} placeholder="Unit" list="mpt-parse-units"
                               value={ing.unit?.name || ""}
-                              onChange={e => updateIngredient(idx, { unit: editedRelation(ing.unit, e.target.value) })} />
-                            <input style={{ flex: "1 1 170px" }} placeholder="Food / ingredient"
+                              onChange={e => updateIngredient(idx, { unit: relationFromOptions(ing.unit, e.target.value, unitOptions) })} />
+                            <input style={{ flex: "1 1 170px" }} placeholder="Food / ingredient" list="mpt-parse-foods"
                               value={ing.food?.name || ""}
-                              onChange={e => updateIngredient(idx, { food: editedRelation(ing.food, e.target.value) })} />
+                              onChange={e => updateIngredient(idx, { food: relationFromOptions(ing.food, e.target.value, foodOptions) })} />
                             <input style={{ flex: "1 1 180px" }} placeholder="Notes"
                               value={ing.note || ""}
                               onChange={e => updateIngredient(idx, { note: e.target.value })} />
@@ -1051,10 +1161,10 @@ function RecipesSection({ api, addLog, cache, onCache, parserEngine }) {
                     </label>
                     <div style={{ display: "flex", gap: 6 }}>
                       <button className="btn-ghost" style={{ fontSize: 11, padding: "3px 10px" }} onClick={() =>
-                        setField("recipeInstructions", [...(editFull.recipeInstructions || []), { text: "", title: "", id: crypto.randomUUID() }])
+                        setField("recipeInstructions", [...(editFull.recipeInstructions || []), { text: "", title: "", id: newClientId() }])
                       }>+ Step</button>
                       <button className="btn-ghost" style={{ fontSize: 11, padding: "3px 10px", color: C.blue, borderColor: C.blue + "66" }} onClick={() =>
-                        setField("recipeInstructions", [...(editFull.recipeInstructions || []), { text: "", title: "Section Header", isHeader: true, id: crypto.randomUUID() }])
+                        setField("recipeInstructions", [...(editFull.recipeInstructions || []), { text: "", title: "Section Header", isHeader: true, id: newClientId() }])
                       }>+ Header</button>
                     </div>
                   </div>
@@ -1393,7 +1503,7 @@ function ParserSection({ api, addLog, parserEngine }) {
     const name = relation?.name?.trim();
     if (!name) return;
     try {
-      const created = await api.post(kind === "food" ? "/foods" : "/units", { name });
+      const created = await findOrCreateRelation(api, kind, name);
       updateReviewIngredient(recipeIndex, ingredientIndex, { [kind]: created });
       addParserLog("ok", `Created ${kind}: ${name}`);
     } catch (e) {
@@ -1435,10 +1545,10 @@ function ParserSection({ api, addLog, parserEngine }) {
               Cancel
             </button>
             <button className="btn-primary" style={{ padding: "8px 20px" }}
-              onClick={saveApproved} disabled={saving || totalApproved === 0}>
-              {saving
-                ? <span style={{ display: "flex", alignItems: "center", gap: 8 }}><Spinner size={13} /> {savePct}%</span>
-                : `💾 Save ${totalApproved} Changes`}
+              onClick={saveApproved} disabled={saving || totalChanged === 0}>
+                {saving
+                  ? <span style={{ display: "flex", alignItems: "center", gap: 8 }}><Spinner size={13} /> {savePct}%</span>
+                : `💾 Save ${totalApproved} Confirmed Changes`}
             </button>
           </div>
         </div>
@@ -2814,7 +2924,7 @@ export default function App() {
           </div>
 
           {/* Content */}
-          <div className="fade-up">
+          <div>
             {tab === "dashboard"  && <DashboardSection  api={conn.api} user={conn.user} addLog={addLog} onNavigate={setTab} />}
             {tab === "recipes"    && <RecipesSection    api={conn.api} addLog={addLog} cache={recipeCache} onCache={setRecipeCache} parserEngine={parserEngine} />}
             {tab === "parser"     && <ParserSection     api={conn.api} addLog={addLog} parserEngine={parserEngine} />}
@@ -2862,30 +2972,32 @@ function BulkSection({ api, addLog, aiConfig }) {
   const [aiError, setAiError] = useState("");
   const [aiSelected, setAiSelected] = useState(new Set());
 
-  useEffect(() => {
-    (async () => {
-      setLoading(true);
-      try {
-        let all = [], page = 1;
-        while (true) {
-          const d = await api.get(`/recipes?page=${page}&perPage=100`);
-          all = [...all, ...(d.items || [])];
-          if (all.length >= d.total) break;
-          page++;
-        }
-        setRecipes(all);
-        const [t, c, cb] = await Promise.all([
-          api.get("/organizers/tags?perPage=500"),
-          api.get("/organizers/categories?perPage=500"),
-          api.get("/households/cookbooks?perPage=100"),
-        ]);
-        setTags(t.items || []);
-        setCategories(c.items || []);
-        setCookbooks(cb.items || []);
-      } catch (e) { addLog("error", e.message); }
-      setLoading(false);
-    })();
+  const loadBulk = useCallback(async () => {
+    setLoading(true);
+    try {
+      let all = [], page = 1;
+      while (true) {
+        const d = await api.get(`/recipes?page=${page}&perPage=100`);
+        all = [...all, ...(d.items || [])];
+        const totalPages = d.totalPages ?? d.total_pages;
+        const total = d.total ?? d.total_count;
+        if (!(d.items || []).length || !(d.next || (totalPages && page < totalPages) || (total != null && all.length < total))) break;
+        page++;
+      }
+      const [t, c, cb] = await Promise.all([
+        api.get("/organizers/tags?perPage=500"),
+        api.get("/organizers/categories?perPage=500"),
+        api.get("/households/cookbooks?perPage=100"),
+      ]);
+      setRecipes(all);
+      setTags(t.items || []);
+      setCategories(c.items || []);
+      setCookbooks(cb.items || []);
+    } catch (e) { addLog("error", e.message); }
+    setLoading(false);
   }, [api]);
+
+  useEffect(() => { loadBulk(); }, [loadBulk]);
 
   const filtered = recipes.filter(r => r.name.toLowerCase().includes(search.toLowerCase()));
   const allSelected = filtered.length > 0 && filtered.every(r => selected.has(r.id));
@@ -2900,6 +3012,7 @@ function BulkSection({ api, addLog, aiConfig }) {
     setRunning(true);
     const selectedRecipes = recipes.filter(r => selected.has(r.id));
     const slugs = selectedRecipes.map(r => r.slug);
+    const localChanges = new Map();
     try {
       if (action === "tag" && assignTag) {
         const tag = tags.find(t => t.id === assignTag);
@@ -2907,7 +3020,9 @@ function BulkSection({ api, addLog, aiConfig }) {
           const full = await api.get(`/recipes/${slug}`);
           const existing = full.tags || [];
           if (!existing.find(t => t.id === assignTag)) {
-            await api.patch(`/recipes/${slug}`, { tags: [...existing.map(taxonomyForSave), taxonomyForSave(tag)] });
+            const tags = [...existing.map(taxonomyForSave), taxonomyForSave(tag)];
+            await api.patch(`/recipes/${slug}`, { tags });
+            localChanges.set(full.id, { tags });
           }
         }
         addLog("ok", `Tag "${tag?.name}" assigned to ${slugs.length} recipes`);
@@ -2917,7 +3032,9 @@ function BulkSection({ api, addLog, aiConfig }) {
           const full = await api.get(`/recipes/${slug}`);
           const existing = full.recipeCategory || [];
           if (!existing.find(c => c.id === assignCat)) {
-            await api.patch(`/recipes/${slug}`, { recipeCategory: [...existing.map(taxonomyForSave), taxonomyForSave(cat)] });
+            const recipeCategory = [...existing.map(taxonomyForSave), taxonomyForSave(cat)];
+            await api.patch(`/recipes/${slug}`, { recipeCategory });
+            localChanges.set(full.id, { recipeCategory });
           }
         }
         addLog("ok", `Category "${cat?.name}" assigned to ${slugs.length} recipes`);
@@ -2936,11 +3053,13 @@ function BulkSection({ api, addLog, aiConfig }) {
         for (const slug of slugs) { await api.delete(`/recipes/${slug}`); }
         setSelected(new Set());
         addLog("ok", `Deleted ${slugs.length} recipes`);
-        const d = await api.get("/recipes?page=1&perPage=100");
-        setRecipes(d.items || []);
+        setRecipes(current => current.filter(recipe => !selected.has(recipe.id)));
       }
     } catch (e) { addLog("error", e.message); }
     setRunning(false);
+    if (localChanges.size) {
+      setRecipes(current => current.map(recipe => ({ ...recipe, ...(localChanges.get(recipe.id) || {}) })));
+    }
   };
 
   const generateAiSuggestions = async () => {
@@ -3692,9 +3811,10 @@ function DataQualitySection({ api, addLog, savedResults, onSaveResults, parserEn
               } else {
                 await api.patch(`/recipes/${r.slug}`, {
                   recipeIngredient: updated.map(ingredientForSave)
-                });
-                addLog("ok", `Parsed: ${r.name}`);
-              }
+                                });
+                                addLog("ok", `Parsed: ${r.name}`);
+                                updateVisibleRecipe(r.slug, { recipeIngredient: updated });
+                              }
             }
           },
           { key: "noSource",       label: "Source URL",       bad: results.noSource,       icon: "🔗",  repair: null,
