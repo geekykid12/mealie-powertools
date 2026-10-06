@@ -6,8 +6,9 @@
 #
 #  2. Replace "mealie_default" below with your actual network name (appears twice).
 #
-#  3. Run:
-#       docker compose -f docker-compose.attach.yml up -d --build
+#  3. Pull and run:
+#       docker compose -f docker-compose.attach.yml pull
+#       docker compose -f docker-compose.attach.yml up -d
 # ─────────────────────────────────────────────────────────────────────────────
 
 networks:
@@ -16,10 +17,7 @@ networks:
 
 services:
   powertools:
-    build:
-      context: .
-      dockerfile: Dockerfile
-    image: mealie-powertools:latest   # explicit image name — prevents <dir>-<service> naming
+    image: ghcr.io/geekykid12/mealie-powertools:latest
     container_name: mealie-powertools
     restart: unless-stopped
     ports:

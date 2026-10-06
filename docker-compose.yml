@@ -2,8 +2,8 @@
 #  Mealie PowerTools — docker-compose.yml
 #
 #  Usage:
-#    Option A — alongside a NEW Mealie install (directory: mealie-power-tools):
-#      docker compose up -d
+#    Option A — alongside a NEW Mealie install:
+#      docker compose pull && docker compose up -d
 #
 #    Option B — alongside an EXISTING Mealie container:
 #      Use docker-compose.attach.yml instead — see that file for instructions.
@@ -45,9 +45,7 @@ services:
 
   # ── Mealie PowerTools ──────────────────────────────────────────────────────
   powertools:
-    build:
-      context: .
-      dockerfile: Dockerfile
+    image: ghcr.io/geekykid12/mealie-powertools:latest
     container_name: mealie-powertools
     restart: unless-stopped
     ports:
@@ -57,7 +55,6 @@ services:
     depends_on:
       mealie:
         condition: service_healthy
-    image: mealie-powertools:latest   # explicit image name — prevents <dir>-<service> naming
     labels:
       - "com.mealie.powertools=true"
 

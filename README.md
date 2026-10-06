@@ -57,10 +57,9 @@ Open `http://<your-server-ip>:3000` in your browser.
 
 Use this if Mealie is already running. Putting PowerTools on the same Docker network as Mealie lets you use the internal container hostname instead of an IP address.
 
-**1. Clone the repo:**
+**1. Download the Compose file:**
 ```bash
-git clone https://github.com/geekykid12/mealie-powertools.git
-cd mealie-powertools
+curl -LO https://raw.githubusercontent.com/geekykid12/mealie-powertools/main/docker-compose.attach.yml
 ```
 
 **2. Find your Mealie network name:**
@@ -70,8 +69,9 @@ docker inspect mealie --format '{{range $k,$v := .NetworkSettings.Networks}}{{$k
 
 **3. Edit `docker-compose.attach.yml`** — replace `mealie_default` with your network name (it appears twice in the file).
 
-**4. Start PowerTools:**
+**4. Pull and start PowerTools:**
 ```bash
+docker compose -f docker-compose.attach.yml pull
 docker compose -f docker-compose.attach.yml up -d
 ```
 
@@ -83,13 +83,14 @@ PowerTools starts on port 3000. In the connection screen, use `http://mealie:900
 
 Use this if you don't have Mealie running yet and want to start both together.
 
-> **Important:** The directory must be named `mealie-power-tools` (with hyphens) to avoid Docker project name conflicts.
-
 ```bash
-git clone https://github.com/geekykid12/mealie-powertools.git mealie-power-tools
-cd mealie-power-tools
+curl -LO https://raw.githubusercontent.com/geekykid12/mealie-powertools/main/docker-compose.yml
+docker pull ghcr.io/geekykid12/mealie-powertools:latest
 docker compose up -d
 ```
+
+Compose pulls the published PowerTools image from GHCR automatically. To force
+an image refresh first, run `docker compose pull` before `docker compose up -d`.
 
 This starts both Mealie (port 9000) and PowerTools (port 3000). Default Mealie login: `changeme@example.com` / `MyPassword`.
 
@@ -101,8 +102,11 @@ In the PowerTools connection screen, use `http://mealie:9000/api` as the Mealie 
 
 ```bash
 docker pull ghcr.io/geekykid12/mealie-powertools:latest
-docker compose -f docker-compose.attach.yml up -d   # restarts with new image
+docker compose up -d
 ```
+
+For an existing-Mealie installation, run the same commands with
+`-f docker-compose.attach.yml`.
 
 Or for Docker Run:
 ```bash
