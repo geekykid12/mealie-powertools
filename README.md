@@ -123,7 +123,7 @@ docker run -d --name mealie-powertools --restart unless-stopped -p 3000:3000 \
 1. Open PowerTools at `http://<your-server-ip>:3000`
 2. Enter your Mealie URL — format: `http://<mealie-ip>:<port>/api`
    - Same Docker network: `http://mealie:9000/api`
-   - Different machine or reverse proxy: `http://192.168.1.154:9925/api`
+   - Different machine or reverse proxy: `http://<mealie-host>:<port>/api`
 3. Enter your Mealie API token
    - Generate one in Mealie → Profile → API Tokens
    - An admin token is recommended for full PowerTools access
