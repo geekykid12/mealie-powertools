@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback, useRef } from "react";
+import { Component, useState, useEffect, useCallback, useRef } from "react";
 
 // ─── Version ─────────────────────────────────────────────────────────────────
 const VERSION = "0.2.0";
@@ -233,11 +233,55 @@ function makeApi(baseUrl, token) {
 // Mealie can return newly parsed foods/units without database IDs. Those
 // relations cannot be written back as { id: null, name }, so keep only
 // resolvable relations in recipe update payloads.
+const relationForSave = (relation) => {
+  if (!relation) return null;
+  const name = typeof relation.name === "string" ? relation.name.trim() : "";
+  if (relation.id) return { id: relation.id, name: name || relation.name };
+  return name ? { name } : null;
+};
+
+const substitutionForSave = (substitution) => {
+  const substituteFoodId = substitution?.substituteFoodId || substitution?.substitute_food_id
+    || substitution?.substituteFood?.id || substitution?.substitute_food?.id || null;
+  const note = typeof substitution?.note === "string" && substitution.note.trim()
+    ? substitution.note.trim()
+    : substitution?.substituteFood?.name || substitution?.substitute_food?.name || "";
+  return {
+    ...(substituteFoodId ? { substituteFoodId } : {}),
+    ...(note ? { note } : {}),
+  };
+};
+
 const ingredientForSave = (ing) => ({
   ...ing,
-  food: ing.food?.id ? { id: ing.food.id, name: ing.food.name } : null,
-  unit: ing.unit?.id ? { id: ing.unit.id, name: ing.unit.name } : null,
+  food: relationForSave(ing.food),
+  unit: relationForSave(ing.unit),
+  substitutions: (ing.substitutions || []).map(substitutionForSave)
+    .filter(sub => sub.substituteFoodId || sub.note),
 });
+
+const ingredientInputText = (ing) => ing.originalText?.trim() || ing.display?.trim() || ing.note?.trim()
+  || [ing.quantity, ing.unit?.name, ing.food?.name].filter(Boolean).join(" ");
+
+// Mealie cookbooks are saved searches, not a recipe-to-cookbook join table.
+// An explicit selection must therefore be represented by an id filter.
+const recipeIdFilter = (ids) => {
+  const values = ids.length ? ids : ["00000000-0000-0000-0000-000000000000"];
+  return `id IN [${values.map(id => JSON.stringify(id)).join(", ")}]`;
+};
+
+class SectionErrorBoundary extends Component {
+  state = { error: null };
+  static getDerivedStateFromError(error) { return { error }; }
+  render() {
+    if (!this.state.error) return this.props.children;
+    return (
+      <div className="card" style={{ color: C.red, padding: 20 }}>
+        This page could not be rendered: {this.state.error.message || String(this.state.error)}
+      </div>
+    );
+  }
+}
 
 const normalizeAiSuggestions = (value) => (Array.isArray(value) ? value : [])
   .flat(Infinity)
@@ -523,7 +567,10 @@ function RecipesSection({ api, addLog, cache, onCache, parserEngine }) {
     setLoading(false);
   }, [api]);
 
-  useEffect(() => { if (!cache?.recipes) load(1, ""); }, [load]);
+  // Parser and editor actions can update recipes from other sections. Refresh
+  // whenever this section mounts so the ingredient status is not left stale in
+  // the shared cache after a successful parse.
+  useEffect(() => { load(page, search); }, [load]);
 
   const del = async (slug, name) => {
     if (!confirm(`Delete "${name}"?`)) return;
@@ -566,6 +613,21 @@ function RecipesSection({ api, addLog, cache, onCache, parserEngine }) {
   };
 
   const setField = (key, val) => setEditFull(f => ({ ...f, [key]: val }));
+  const updateIngredient = (idx, changes) => setEditFull(current => ({
+    ...current,
+    recipeIngredient: (current.recipeIngredient || []).map((ingredient, i) =>
+      i === idx ? { ...ingredient, ...changes, display: "" } : ingredient
+    ),
+  }));
+  const substitutionsText = (ingredient) => (ingredient.substitutions || [])
+    .map(sub => sub.note || sub.substituteFood?.name || "")
+    .filter(Boolean)
+    .join(", ");
+  const editedRelation = (current, value) => {
+    const name = value.trim();
+    if (!name) return null;
+    return { ...(current?.id && current.name === name ? { id: current.id } : {}), name };
+  };
 
   const pages = Math.ceil(total / PER);
 
@@ -632,9 +694,12 @@ function RecipesSection({ api, addLog, cache, onCache, parserEngine }) {
                   </td>
                   <td>
                     {(() => {
-                      const ings = r.recipeIngredient || [];
+                      // Section headers and blank rows are not ingredients and
+                      // must not prevent a recipe from being marked parsed.
+                      const ings = (r.recipeIngredient || [])
+                        .filter(i => !i.title && ingredientInputText(i));
                       if (ings.length === 0) return <span className="tag tag-muted">none</span>;
-                      const parsed = ings.filter(i => i.food || i.unit).length;
+                      const parsed = ings.filter(i => i.food).length;
                       const all = parsed === ings.length;
                       const none = parsed === 0;
                       return (
@@ -658,9 +723,9 @@ function RecipesSection({ api, addLog, cache, onCache, parserEngine }) {
                             const inputIndexes = [];
                             const ings = (full.recipeIngredient || [])
                               .map((i, index) => {
-                                if (!i.display && !i.note) return null;
+                                if (!ingredientInputText(i)) return null;
                                 inputIndexes.push(index);
-                                return i.display || i.note || "";
+                                return ingredientInputText(i);
                               })
                               .filter(Boolean);
                             if (ings.length) {
@@ -676,6 +741,9 @@ function RecipesSection({ api, addLog, cache, onCache, parserEngine }) {
                                     food: parsedIngredient.ingredient?.food,
                                     unit: parsedIngredient.ingredient?.unit,
                                     quantity: parsedIngredient.ingredient?.quantity,
+                                    note: parsedIngredient.ingredient?.note || "",
+                                    originalText: ing.originalText,
+                                    display: "",
                                   } : {})
                                 };
                               });
@@ -798,16 +866,23 @@ function RecipesSection({ api, addLog, cache, onCache, parserEngine }) {
                     </label>
                     <div style={{ display: "flex", gap: 6 }}>
                       <button className="btn-ghost" style={{ fontSize: 11, padding: "3px 10px" }} onClick={() =>
-                        setField("recipeIngredient", [...(editFull.recipeIngredient || []), { note: "", display: "", quantity: null, unit: null, food: null, title: "", referenceId: crypto.randomUUID() }])
+                        setField("recipeIngredient", [...(editFull.recipeIngredient || []), { note: "", display: "", quantity: null, unit: null, food: null, substitutions: [], title: "", referenceId: crypto.randomUUID() }])
                       }>+ Ingredient</button>
                       <button className="btn-ghost" style={{ fontSize: 11, padding: "3px 10px", color: C.blue, borderColor: C.blue + "66" }} onClick={() =>
                         setField("recipeIngredient", [...(editFull.recipeIngredient || []), { note: "", display: "", quantity: null, unit: null, food: null, title: "Section Header", isHeader: true, referenceId: crypto.randomUUID() }])
                       }>+ Header</button>
                     </div>
                   </div>
+                  <div style={{ display: "flex", gap: 8, padding: "0 22px 2px 14px", color: C.muted, fontSize: 10, textTransform: "uppercase", letterSpacing: ".05em" }}>
+                    <span style={{ width: 72 }}>Quantity</span>
+                    <span style={{ width: 125 }}>Unit</span>
+                    <span style={{ flex: "1 1 170px" }}>Food</span>
+                    <span style={{ flex: "1 1 180px" }}>Notes</span>
+                    <span style={{ flex: "1 1 180px" }}>Substitutions</span>
+                  </div>
                   <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
                     {(editFull.recipeIngredient || []).map((ing, idx) => (
-                      <div key={ing.referenceId || idx} style={{ display: "flex", gap: 8, alignItems: "center" }}>
+                      <div key={ing.referenceId || idx} style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
                         {ing.isHeader || ing.title ? (
                           <>
                             <div style={{ fontSize: 10, color: C.blue, fontWeight: 700, textTransform: "uppercase", letterSpacing: ".06em", flexShrink: 0 }}>§</div>
@@ -823,12 +898,23 @@ function RecipesSection({ api, addLog, cache, onCache, parserEngine }) {
                         ) : (
                           <>
                             <div style={{ width: 6, height: 6, borderRadius: "50%", flexShrink: 0, background: (ing.food || ing.unit) ? C.green : C.red }} />
-                            <input style={{ flex: 1 }} value={ing.display || ing.note || ""}
-                              onChange={e => {
-                                const updated = [...editFull.recipeIngredient];
-                                updated[idx] = { ...ing, display: e.target.value, note: e.target.value };
-                                setField("recipeIngredient", updated);
-                              }} />
+                            <input style={{ width: 72 }} type="number" step="any" min="0" placeholder="Qty"
+                              value={ing.quantity ?? ""}
+                              onChange={e => updateIngredient(idx, { quantity: e.target.value === "" ? null : Number(e.target.value) })} />
+                            <input style={{ width: 125 }} placeholder="Unit"
+                              value={ing.unit?.name || ""}
+                              onChange={e => updateIngredient(idx, { unit: editedRelation(ing.unit, e.target.value) })} />
+                            <input style={{ flex: "1 1 170px" }} placeholder="Food / ingredient"
+                              value={ing.food?.name || ""}
+                              onChange={e => updateIngredient(idx, { food: editedRelation(ing.food, e.target.value) })} />
+                            <input style={{ flex: "1 1 180px" }} placeholder="Notes"
+                              value={ing.note || ""}
+                              onChange={e => updateIngredient(idx, { note: e.target.value })} />
+                            <input style={{ flex: "1 1 180px" }} placeholder="Substitutions (comma separated)"
+                              value={substitutionsText(ing)}
+                              onChange={e => updateIngredient(idx, {
+                                substitutions: e.target.value.split(",").map(value => ({ note: value.trim() })).filter(sub => sub.note),
+                              })} />
                           </>
                         )}
                         <button className="btn-danger" style={{ padding: "4px 8px", flexShrink: 0 }}
@@ -978,7 +1064,7 @@ function ParserSection({ api, addLog, parserEngine }) {
   const needsParsing = (recipe) => {
     const ings = recipe.recipeIngredient || [];
     if (ings.length === 0) return false;
-    return ings.some(ing => !ing.food && !ing.unit);
+    return ings.some(ing => !ing.title && ingredientInputText(ing) && !ing.food);
   };
 
   const callParser = async (recipe) => {
@@ -986,9 +1072,9 @@ function ParserSection({ api, addLog, parserEngine }) {
     const inputIndexes = [];
     const ingredients = (recipe.recipeIngredient || [])
       .map((i, index) => {
-        if (!i.display && !i.note) return null;
+        if (!ingredientInputText(i)) return null;
         inputIndexes.push(index);
-        return i.display || i.note || "";
+        return ingredientInputText(i);
       })
       .filter(Boolean);
     if (!ingredients.length) return null;
@@ -1013,9 +1099,12 @@ function ParserSection({ api, addLog, parserEngine }) {
         unit: parsed[idx].ingredient?.unit,
         // Only accept quantity if original had one, or if display text contains a number
         // Prevents parser from inventing quantities like "2 tsp" for "some marjoram"
-        quantity: (ing.quantity || /\d/.test(ing.display || ing.note || ""))
+        quantity: (ing.quantity || /\d/.test(ingredientInputText(ing)))
           ? parsed[idx].ingredient?.quantity
           : null,
+        note: parsed[idx].ingredient?.note || "",
+        originalText: ing.originalText,
+        display: "",
       } : {}),
     }));
 
@@ -1062,29 +1151,51 @@ function ParserSection({ api, addLog, parserEngine }) {
               // Collect for review — pair each original ingredient with its parse result
               const items = recipe.recipeIngredient.map((ing, idx) => {
                 const p = parsed[idx]?.ingredient;
-                const hasResult = p?.food || p?.unit;
-                const changed = hasResult && (
+                const candidate = {
+                  ...ing,
+                  food: p?.food || ing.food || null,
+                  unit: p?.unit || ing.unit || null,
+                  quantity: p?.quantity ?? ing.quantity,
+                  note: p?.note ?? ing.note ?? "",
+                  substitutions: p?.substitutions || ing.substitutions || [],
+                  display: "",
+                };
+                const changed = (
                   (p?.food?.name !== ing.food?.name) ||
                   (p?.unit?.name !== ing.unit?.name) ||
-                  (p?.quantity !== ing.quantity && p?.quantity != null)
+                  (p?.quantity !== ing.quantity && p?.quantity != null) ||
+                  (p?.note != null && p.note !== ing.note)
                 );
+                const unresolved = (
+                  !ing.title && ingredientInputText(ing) && (!candidate.food || !candidate.food.id)
+                ) || !!(candidate.unit && !candidate.unit.id);
                 return {
-                  original: { display: ing.display || ing.note || "", food: ing.food?.name, unit: ing.unit?.name, qty: ing.quantity },
-                  parsed: p ? { food: p.food?.name, unit: p.unit?.name, qty: p.quantity } : null,
+                  original: { display: ingredientInputText(ing), food: ing.food?.name, unit: ing.unit?.name, qty: ing.quantity },
+                  parsed: p ? { food: candidate.food?.name, unit: candidate.unit?.name, qty: candidate.quantity, note: candidate.note } : null,
                   changed,
+                  unresolved,
                   // Don't auto-approve if parser invented a quantity with no numeric text in original
-                  quantityAssumed: !ing.quantity && p?.quantity && !/\d/.test(ing.display || ing.note || ""),
-                  approved: changed, // default approve changed ones
+                  quantityAssumed: !ing.quantity && candidate.quantity && !/\d/.test(ingredientInputText(ing)),
+                  approved: changed && !unresolved, // unresolved rows require confirmation/editing
                   parsedRaw: parsed[idx],
                   ingRaw: ing,
+                  candidate,
                 };
               });
               collected.push({ recipe, items, allUpdated: buildUpdated(recipe, parsed) });
               addParserLog("ok", `✓ ${recipe.name} — ${items.filter(i => i.changed).length}/${items.length} changed`);
             } else {
               // Auto-save immediately
-              await saveRecipe(recipe, buildUpdated(recipe, parsed));
-              addParserLog("ok", `✓ Saved: ${recipe.name}`);
+              const updated = buildUpdated(recipe, parsed);
+              const unresolved = updated.some(ing =>
+                !ing.title && ingredientInputText(ing) && !ing.food
+              );
+              if (unresolved) {
+                addParserLog("warn", `⚠ Skipped: ${recipe.name} has ingredients that Mealie could not match; use review mode to confirm or create them`);
+              } else {
+                await saveRecipe(recipe, updated);
+                addParserLog("ok", `✓ Saved: ${recipe.name}`);
+              }
             }
           } catch (e) {
             addParserLog("error", `✗ ${recipe.name}: ${e.message}`);
@@ -1117,14 +1228,8 @@ function ParserSection({ api, addLog, parserEngine }) {
         // Build updated ingredients respecting per-ingredient approval
         const updatedIngredients = item.recipe.recipeIngredient.map((ing, idx) => {
           const reviewIng = item.items[idx];
-          if (!reviewIng || !reviewIng.approved || !reviewIng.parsedRaw) return ing;
-          const p = reviewIng.parsedRaw.ingredient;
-          return {
-            ...ing,
-            food: p?.food || ing.food,
-            unit: p?.unit || ing.unit,
-            quantity: p?.quantity ?? ing.quantity,
-          };
+          if (!reviewIng || !reviewIng.approved) return ing;
+          return reviewIng.candidate || ing;
         });
         const anyApproved = item.items.some(i => i.approved);
         if (anyApproved) {
@@ -1146,12 +1251,41 @@ function ParserSection({ api, addLog, parserEngine }) {
     setReviewItems([]);
   };
 
+  const updateReviewIngredient = (recipeIndex, ingredientIndex, changes) => {
+    setReviewItems(items => items.map((recipeItem, ri) => ri !== recipeIndex ? recipeItem : ({
+      ...recipeItem,
+      items: recipeItem.items.map((item, ii) => ii !== ingredientIndex ? item : ({
+        ...(() => {
+          const candidate = { ...item.candidate, ...changes, display: "" };
+          const unresolved = (
+            !item.ingRaw?.title && item.original?.display && (!candidate.food || !candidate.food.id)
+          ) || !!(candidate.unit && !candidate.unit.id);
+          return { ...item, candidate, approved: !unresolved, unresolved };
+        })(),
+      })),
+    })));
+  };
+
+  const createReviewRelation = async (recipeIndex, ingredientIndex, kind) => {
+    const item = reviewItems[recipeIndex]?.items[ingredientIndex];
+    const relation = item?.candidate?.[kind];
+    const name = relation?.name?.trim();
+    if (!name) return;
+    try {
+      const created = await api.post(kind === "food" ? "/foods" : "/units", { name });
+      updateReviewIngredient(recipeIndex, ingredientIndex, { [kind]: created });
+      addParserLog("ok", `Created ${kind}: ${name}`);
+    } catch (e) {
+      addParserLog("error", `Could not create ${kind} "${name}": ${e.message}`);
+    }
+  };
+
   const pct = progress.total ? Math.round((progress.done / progress.total) * 100) : 0;
   const savePct = saveProgress.total ? Math.round((saveProgress.done / saveProgress.total) * 100) : 0;
 
   // ── Review Modal ─────────────────────────────────────────────────────────────
   if (reviewing && reviewItems.length > 0) {
-    const totalChanged = reviewItems.reduce((s, r) => s + r.items.filter(i => i.changed).length, 0);
+    const totalChanged = reviewItems.reduce((s, r) => s + r.items.filter(i => i.changed || i.unresolved).length, 0);
     const totalApproved = reviewItems.reduce((s, r) => s + r.items.filter(i => i.approved).length, 0);
 
     return (
@@ -1168,7 +1302,7 @@ function ParserSection({ api, addLog, parserEngine }) {
             <button className="btn-ghost" onClick={() => {
               // Approve all
               setReviewItems(items => items.map(r => ({
-                ...r, items: r.items.map(i => ({ ...i, approved: i.changed }))
+                ...r, items: r.items.map(i => ({ ...i, approved: i.changed && !i.unresolved }))
               })));
             }}>✓ Approve All Changed</button>
             <button className="btn-ghost" onClick={() => {
@@ -1190,9 +1324,9 @@ function ParserSection({ api, addLog, parserEngine }) {
 
         {/* Per-recipe review cards */}
         {reviewItems.map((item, rIdx) => {
-          const changedCount = item.items.filter(i => i.changed).length;
+          const changedCount = item.items.filter(i => i.changed || i.unresolved).length;
           const approvedCount = item.items.filter(i => i.approved).length;
-          if (changedCount === 0) return null; // skip recipes with no changes
+          if (changedCount === 0) return null; // skip recipes with no changes or unresolved values
 
           return (
             <div key={item.recipe.id} className="card" style={{ padding: 0, overflow: "hidden" }}>
@@ -1204,7 +1338,7 @@ function ParserSection({ api, addLog, parserEngine }) {
                   <span className="tag tag-green">{approvedCount} approved</span>
                   <button className="btn-ghost" style={{ fontSize: 11, padding: "3px 10px" }}
                     onClick={() => setReviewItems(items => items.map((r, ri) => ri !== rIdx ? r : {
-                      ...r, items: r.items.map(i => ({ ...i, approved: i.changed }))
+                      ...r, items: r.items.map(i => ({ ...i, approved: i.changed && !i.unresolved }))
                     }))}>Approve all</button>
                   <button className="btn-ghost" style={{ fontSize: 11, padding: "3px 10px" }}
                     onClick={() => setReviewItems(items => items.map((r, ri) => ri !== rIdx ? r : {
@@ -1218,34 +1352,65 @@ function ParserSection({ api, addLog, parserEngine }) {
                     <th style={{ width: 36 }}>✓</th>
                     <th>Original Text</th>
                     <th>Was</th>
-                    <th>Now Detected</th>
+                    <th>Food</th>
+                    <th>Unit</th>
+                    <th>Qty</th>
+                    <th>Note</th>
+                    <th>Substitutions</th>
                     <th>Status</th>
                   </tr>
                 </thead>
                 <tbody>
                   {item.items.map((ing, iIdx) => {
-                    if (!ing.changed && !ing.parsed) return null;
+                    if (!ing.changed && !ing.unresolved && !ing.parsed) return null;
+                    const candidate = ing.candidate || ing.ingRaw;
+                    const foodUnresolved = !!candidate.food && !candidate.food.id;
+                    const unitUnresolved = !!candidate.unit && !candidate.unit.id;
                     return (
                       <tr key={iIdx} style={{ background: ing.approved ? `${C.green}08` : undefined }}>
                         <td>
                           <input type="checkbox" checked={!!ing.approved}
                             onChange={e => setReviewItems(items => items.map((r, ri) => ri !== rIdx ? r : {
-                              ...r, items: r.items.map((x, xi) => xi !== iIdx ? x : { ...x, approved: e.target.checked })
+                              ...r, items: r.items.map((x, xi) => xi !== iIdx ? x : { ...x, approved: e.target.checked && !x.unresolved })
                             }))} />
                         </td>
                         <td style={{ fontSize: 12 }}>{ing.original.display || "—"}</td>
                         <td style={{ fontSize: 11, color: C.muted }}>
                           {[ing.original.qty, ing.original.unit, ing.original.food].filter(Boolean).join(" ") || "—"}
                         </td>
-                        <td style={{ fontSize: 11 }}>
-                          {ing.parsed ? (
-                            <span style={{ color: C.green }}>
-                              {[ing.parsed.qty, ing.parsed.unit, ing.parsed.food].filter(Boolean).join(" ") || "—"}
-                            </span>
-                          ) : <span style={{ color: C.muted }}>no change</span>}
+                        <td>
+                          <input style={{ width: 150 }} placeholder="Food"
+                            value={candidate.food?.name || ""}
+                            onChange={e => updateReviewIngredient(rIdx, iIdx, { food: e.target.value.trim() ? { ...(candidate.food?.id ? { id: candidate.food.id } : {}), name: e.target.value } : null })} />
+                          {foodUnresolved && <button className="btn-ghost" style={{ fontSize: 10, padding: "2px 6px", marginTop: 3 }} onClick={() => createReviewRelation(rIdx, iIdx, "food")}>Create Food</button>}
                         </td>
                         <td>
-                          {!ing.changed
+                          <input style={{ width: 105 }} placeholder="Unit"
+                            value={candidate.unit?.name || ""}
+                            onChange={e => updateReviewIngredient(rIdx, iIdx, { unit: e.target.value.trim() ? { ...(candidate.unit?.id ? { id: candidate.unit.id } : {}), name: e.target.value } : null })} />
+                          {unitUnresolved && <button className="btn-ghost" style={{ fontSize: 10, padding: "2px 6px", marginTop: 3 }} onClick={() => createReviewRelation(rIdx, iIdx, "unit")}>Create Unit</button>}
+                        </td>
+                        <td>
+                          <input style={{ width: 62 }} type="number" step="any" min="0" placeholder="Qty"
+                            value={candidate.quantity ?? ""}
+                            onChange={e => updateReviewIngredient(rIdx, iIdx, { quantity: e.target.value === "" ? null : Number(e.target.value) })} />
+                        </td>
+                        <td>
+                          <input style={{ width: 170 }} placeholder="Notes"
+                            value={candidate.note || ""}
+                            onChange={e => updateReviewIngredient(rIdx, iIdx, { note: e.target.value })} />
+                        </td>
+                        <td>
+                          <input style={{ width: 170 }} placeholder="Comma-separated substitutions"
+                            value={(candidate.substitutions || []).map(sub => sub.note || sub.substituteFood?.name || "").filter(Boolean).join(", ")}
+                            onChange={e => updateReviewIngredient(rIdx, iIdx, {
+                              substitutions: e.target.value.split(",").map(value => ({ note: value.trim() })).filter(sub => sub.note),
+                            })} />
+                        </td>
+                        <td>
+                          {ing.unresolved
+                            ? <span className="tag tag-yellow">Needs review</span>
+                            : !ing.changed
                             ? <span className="tag tag-muted">unchanged</span>
                             : ing.approved
                               ? <span className="tag tag-green">✓ approved</span>
@@ -1803,7 +1968,12 @@ function CookbooksSection({ api, addLog, cache, onCache, aiConfig }) {
     if (!name) return;
     setSaving(true);
     try {
-      await api.post("/households/cookbooks", { name, description: newDesc.trim(), public: false });
+      await api.post("/households/cookbooks", {
+        name,
+        description: newDesc.trim(),
+        public: false,
+        queryFilterString: recipeIdFilter([]),
+      });
       addLog("ok", `Created: ${name}`);
       setNewName(""); setNewDesc(""); setCreating(false);
       load();
@@ -1870,13 +2040,19 @@ function CookbooksSection({ api, addLog, cache, onCache, aiConfig }) {
     const includedRecipes = reviewRecipes.filter(r => r.included).map(r => r.recipe);
     try {
       if (reviewing.existingCb) {
-        // Cookbook already exists — just log, Mealie cookbooks use filter rules not explicit lists
-        addLog("ok", `Cookbook "${reviewing.existingCb.name}" already exists. Note: Mealie cookbooks use category/tag filters, not explicit recipe lists. Open it in Mealie to adjust filters.`);
+        await api.put(`/households/cookbooks/${reviewing.existingCb.id}`, {
+          name: reviewing.existingCb.name,
+          description: reviewing.existingCb.description || "",
+          public: reviewing.existingCb.public || false,
+          queryFilterString: recipeIdFilter(includedRecipes.map(recipe => recipe.id)),
+        });
+        addLog("ok", `Updated cookbook "${reviewing.existingCb.name}" with ${includedRecipes.length} selected recipes`);
       } else {
         await api.post("/households/cookbooks", {
           name: reviewing.name,
           description: reviewing.description,
           public: false,
+          queryFilterString: recipeIdFilter(includedRecipes.map(recipe => recipe.id)),
         });
         addLog("ok", `Created cookbook: ${reviewing.name} (${includedRecipes.length} recipes suggested)`);
       }
@@ -1908,7 +2084,7 @@ function CookbooksSection({ api, addLog, cache, onCache, aiConfig }) {
             <div style={{ color: C.muted, fontSize: 13, marginTop: 4 }}>{reviewing.description}</div>
             {isExisting && (
               <div style={{ marginTop: 10, padding: "8px 12px", background: `${C.yellow}18`, border: `1px solid ${C.yellow}44`, borderRadius: 8, fontSize: 12, color: C.yellow }}>
-                ⚠ A cookbook named "<strong>{reviewing.existingCb.name}</strong>" already exists. Confirming will note the suggested recipes but won't duplicate the cookbook.
+                ⚠ A cookbook named "<strong>{reviewing.existingCb.name}</strong>" already exists. Confirming will update its saved recipe filter.
               </div>
             )}
           </div>
@@ -1916,7 +2092,7 @@ function CookbooksSection({ api, addLog, cache, onCache, aiConfig }) {
             <button className="btn-ghost" onClick={() => setReviewing(null)}>← Back</button>
             <button className="btn-primary" style={{ padding: "8px 20px" }}
               onClick={finalize} disabled={finalizing}>
-              {finalizing ? <Spinner size={13} /> : isExisting ? "Acknowledge" : `✓ Create with ${includedCount} recipes`}
+              {finalizing ? <Spinner size={13} /> : isExisting ? `✓ Update with ${includedCount} recipes` : `✓ Create with ${includedCount} recipes`}
             </button>
           </div>
         </div>
@@ -1926,7 +2102,7 @@ function CookbooksSection({ api, addLog, cache, onCache, aiConfig }) {
             <strong style={{ color: C.text }}>{includedCount}</strong> recipes included · <strong style={{ color: C.text }}>{reviewRecipes.length - includedCount}</strong> excluded
           </div>
           <div style={{ fontSize: 11, color: C.muted }}>
-            💡 Note: Mealie cookbooks use category/tag filter rules, not explicit recipe lists. Creating the cookbook here sets it up — you'll assign its filter rules in Mealie.
+            💡 Mealie cookbooks are saved filters. PowerTools will save the selected recipe IDs as the cookbook filter.
           </div>
         </div>
 
@@ -2526,7 +2702,7 @@ export default function App() {
             {tab === "cookbooks"  && <CookbooksSection  api={conn.api} addLog={addLog} cache={cookbooksCache} onCache={setCookbooksCache} aiConfig={aiConfig} />}
             {tab === "quality"    && <DataQualitySection api={conn.api} addLog={addLog} savedResults={qualityResults} onSaveResults={setQualityResults} parserEngine={parserEngine} />}
             {tab === "images"     && <ImageSection      api={conn.api} addLog={addLog} />}
-            {tab === "activity"   && <ActivitySection   api={conn.api} addLog={addLog} />}
+            {tab === "activity"   && <SectionErrorBoundary><ActivitySection api={conn.api} addLog={addLog} /></SectionErrorBoundary>}
             {tab === "households" && <HouseholdsSection api={conn.api} addLog={addLog} cache={householdCache} onCache={setHouseholdCache} />}
             {tab === "admin"      && <AdminSection      api={conn.api} addLog={addLog} aiConfig={aiConfig} onSaveAiConfig={saveAiConfig} parserEngine={parserEngine} onSaveParserEngine={saveParserEngine} />}
           </div>
@@ -2601,7 +2777,8 @@ function BulkSection({ api, addLog, aiConfig }) {
   const run = async (action) => {
     if (selected.size === 0) return;
     setRunning(true);
-    const slugs = recipes.filter(r => selected.has(r.id)).map(r => r.slug);
+    const selectedRecipes = recipes.filter(r => selected.has(r.id));
+    const slugs = selectedRecipes.map(r => r.slug);
     try {
       if (action === "tag" && assignTag) {
         const tag = tags.find(t => t.id === assignTag);
@@ -2624,8 +2801,15 @@ function BulkSection({ api, addLog, aiConfig }) {
         }
         addLog("ok", `Category "${cat?.name}" assigned to ${slugs.length} recipes`);
       } else if (action === "cookbook" && assignCb) {
-        // Mealie cookbooks use filter rules not recipe lists — we can only note this
-        addLog("warn", `Note: Mealie cookbooks use filter rules. Cookbook "${cookbooks.find(c=>c.id===assignCb)?.name}" cannot directly contain recipes — use Tags/Categories to filter into it.`);
+        const cookbook = cookbooks.find(c => c.id === assignCb);
+        if (!cookbook) throw new Error("Cookbook not found");
+        await api.put(`/households/cookbooks/${assignCb}`, {
+          name: cookbook.name,
+          description: cookbook.description || "",
+          public: cookbook.public || false,
+          queryFilterString: recipeIdFilter(selectedRecipes.map(recipe => recipe.id)),
+        });
+        addLog("ok", `Cookbook "${cookbook.name}" updated with ${selectedRecipes.length} selected recipes`);
       } else if (action === "delete") {
         if (!confirm(`Permanently delete ${selected.size} recipes?`)) { setRunning(false); return; }
         for (const slug of slugs) { await api.delete(`/recipes/${slug}`); }
@@ -3300,8 +3484,7 @@ function DataQualitySection({ api, addLog, savedResults, onSaveResults, parserEn
       const noTime = full.filter(r => !r.prepTime && !r.cookTime && !r.totalTime);
       const noTags = full.filter(r => (!r.tags || r.tags.length === 0) && (!r.recipeCategory || r.recipeCategory.length === 0));
       const unparsed = full.filter(r =>
-        (r.recipeIngredient || []).length > 0 &&
-        (r.recipeIngredient || []).every(i => !i.food && !i.unit)
+        (r.recipeIngredient || []).some(i => !i.title && ingredientInputText(i) && !i.food)
       );
       const noSource = full.filter(r => !r.orgURL || r.orgURL.trim() === "");
       const noRating = full.filter(r => !r.rating || r.rating === 0);
@@ -3358,9 +3541,9 @@ function DataQualitySection({ api, addLog, savedResults, onSaveResults, parserEn
               const inputIndexes = [];
               const ings = (r.recipeIngredient || [])
                 .map((i, index) => {
-                  if (!i.display && !i.note) return null;
+                  if (!ingredientInputText(i)) return null;
                   inputIndexes.push(index);
-                  return i.display || i.note || "";
+                  return ingredientInputText(i);
                 })
                 .filter(Boolean);
               if (!ings.length) return;
@@ -3376,6 +3559,9 @@ function DataQualitySection({ api, addLog, savedResults, onSaveResults, parserEn
                     food: parsedIngredient.ingredient?.food,
                     unit: parsedIngredient.ingredient?.unit,
                     quantity: parsedIngredient.ingredient?.quantity,
+                    note: parsedIngredient.ingredient?.note || "",
+                    originalText: ing.originalText,
+                    display: "",
                   } : {})
                 };
               });
