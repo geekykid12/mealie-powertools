@@ -1,7 +1,14 @@
 import { Component, useState, useEffect, useCallback, useRef } from "react";
+import {
+  cookbookPayload,
+  ingredientForSave,
+  normalizeRecipe,
+  normalizeAiSuggestions,
+  taxonomyForSave,
+} from "./apiAdapters.mjs";
 
 // ─── Version ─────────────────────────────────────────────────────────────────
-const VERSION = "0.2.1";
+const VERSION = "1.0.0";
 
 // ─── Design tokens ───────────────────────────────────────────────────────────
 const C = {
@@ -233,50 +240,13 @@ function makeApi(baseUrl, token) {
 // Mealie can return newly parsed foods/units without database IDs. Those
 // relations cannot be written back as { id: null, name }, so keep only
 // resolvable relations in recipe update payloads.
-const relationForSave = (relation) => {
-  if (!relation) return null;
-  const name = typeof relation.name === "string" ? relation.name.trim() : "";
-  if (relation.id) return { id: relation.id, name: name || relation.name };
-  return name ? { name } : null;
-};
-
-const substitutionForSave = (substitution) => {
-  const substituteFoodId = substitution?.substituteFoodId || substitution?.substitute_food_id
-    || substitution?.substituteFood?.id || substitution?.substitute_food?.id || null;
-  const note = typeof substitution?.note === "string" && substitution.note.trim()
-    ? substitution.note.trim()
-    : substitution?.substituteFood?.name || substitution?.substitute_food?.name || "";
-  return {
-    ...(substituteFoodId ? { substituteFoodId } : {}),
-    ...(note ? { note } : {}),
-  };
-};
-
-const ingredientForSave = (ing) => ({
-  ...ing,
-  food: relationForSave(ing.food),
-  unit: relationForSave(ing.unit),
-  substitutions: (ing.substitutions || []).map(substitutionForSave)
-    .filter(sub => sub.substituteFoodId || sub.note),
-});
-
 const ingredientInputText = (ing) => ing.originalText?.trim() || ing.display?.trim() || ing.note?.trim()
   || [ing.quantity, ing.unit?.name, ing.food?.name].filter(Boolean).join(" ");
 
+const isIngredientRow = (ing) => !!ing && !ing.isHeader && !ing.title;
+
 const ingredientNeedsFoodReview = (ing) =>
   !ing.title && ingredientInputText(ing) && (!ing.food || !ing.food.id);
-
-const slugifyTaxonomyName = (name) => String(name || "")
-  .trim()
-  .toLowerCase()
-  .replace(/[^a-z0-9]+/g, "-")
-  .replace(/^-+|-+$/g, "");
-
-const taxonomyForSave = (item) => item && ({
-  id: item.id,
-  name: item.name,
-  slug: item.slug || slugifyTaxonomyName(item.name),
-});
 
 const newClientId = () => {
   if (globalThis.crypto?.randomUUID) return globalThis.crypto.randomUUID();
@@ -307,10 +277,6 @@ const findOrCreateRelation = async (api, kind, name) => {
 
 // Mealie cookbooks are saved searches, not a recipe-to-cookbook join table.
 // An explicit selection must therefore be represented by an id filter.
-const recipeIdFilter = (ids) => {
-  const values = ids.length ? ids : ["00000000-0000-0000-0000-000000000000"];
-  return `id IN [${values.map(id => JSON.stringify(id)).join(", ")}]`;
-};
 
 class SectionErrorBoundary extends Component {
   state = { error: null };
@@ -325,10 +291,6 @@ class SectionErrorBoundary extends Component {
   }
 }
 
-const normalizeAiSuggestions = (value) => (Array.isArray(value) ? value : [])
-  .flat(Infinity)
-  .filter(s => s && typeof s === "object" && typeof s.name === "string" && s.name.trim());
-
 // ─── Connection Setup ─────────────────────────────────────────────────────────
 const LS_URL    = "mpt_url";
 const LS_TOKEN  = "mpt_token";
@@ -340,9 +302,6 @@ function ConnectPanel({ onConnect }) {
   });
   const [token, setToken]   = useState(() => {
     try { return localStorage.getItem(LS_TOKEN) || ""; } catch { return ""; }
-  });
-  const [remember, setRemember] = useState(() => {
-    try { return !!localStorage.getItem(LS_TOKEN); } catch { return false; }
   });
   const [loading, setLoading] = useState(false);
   const [err, setErr]         = useState("");
@@ -372,11 +331,12 @@ function ConnectPanel({ onConnect }) {
     try {
       const api = makeApi(url, token);
       const user = await api.get("/users/self");
-      if (remember) {
-        try { localStorage.setItem(LS_URL, url); localStorage.setItem(LS_TOKEN, token); } catch {}
-      } else {
-        try { localStorage.removeItem(LS_URL); localStorage.removeItem(LS_TOKEN); } catch {}
-      }
+      // A successful connection is persistent by default. The user can remove
+      // these values explicitly with “Forget saved credentials” in the sidebar.
+      try {
+        localStorage.setItem(LS_URL, url.trim());
+        localStorage.setItem(LS_TOKEN, token.trim());
+      } catch {}
       onConnect({ url, token, user, api });
     } catch (e) {
       setErr(e.message);
@@ -442,20 +402,10 @@ function ConnectPanel({ onConnect }) {
               ⚠ {err}
             </div>
           )}
-          {/* Remember me */}
-          <label style={{ display: "flex", alignItems: "center", gap: 10, cursor: "pointer", fontSize: 13 }}>
-            <div style={{
-              width: 36, height: 20, borderRadius: 10, transition: "background .2s",
-              background: remember ? C.accent : C.border, position: "relative", flexShrink: 0,
-            }} onClick={() => setRemember(r => !r)}>
-              <div style={{
-                position: "absolute", top: 2, left: remember ? 18 : 2,
-                width: 16, height: 16, borderRadius: "50%", background: "#fff",
-                transition: "left .2s",
-              }} />
-            </div>
-            <span style={{ color: C.muted }}>Remember me on this device</span>
-          </label>
+          <div style={{ color: C.muted, fontSize: 12, lineHeight: 1.5 }}>
+            Your connection is saved in this browser and will be restored after a refresh.
+            Use <strong style={{ color: C.text }}>Forget saved credentials</strong> in the sidebar to remove it.
+          </div>
           <button className="btn-primary" style={{ width: "100%", padding: "12px" }} onClick={test} disabled={loading || !token}>
             {loading ? <Spinner size={14} /> : "Connect →"}
           </button>
@@ -590,6 +540,8 @@ function RecipesSection({ api, addLog, cache, onCache, parserEngine }) {
   const [parseReview, setParseReview] = useState(null);
   const [foodOptions, setFoodOptions] = useState([]);
   const [unitOptions, setUnitOptions] = useState([]);
+  const [tagOptions, setTagOptions] = useState([]);
+  const [categoryOptions, setCategoryOptions] = useState([]);
   const [tableSort, setTableSort] = useState({ field: "name", dir: "asc" });
   const [colFilters, setColFilters] = useState({});
   const fmtDate = (dt) => dt ? new Date(dt).toLocaleDateString("en-US", { month: "short", day: "numeric", year: "numeric" }) : "—";
@@ -620,22 +572,34 @@ function RecipesSection({ api, addLog, cache, onCache, parserEngine }) {
     onCache({ recipes: next, total, page, search, loadedAt: Date.now() });
   };
 
-  // Parser and editor actions can update recipes from other sections. Refresh
-  // whenever this section mounts so the ingredient status is not left stale in
-  // the shared cache after a successful parse.
-  useEffect(() => { load(page, search); }, [load]);
+  // Hydrate from the shared cache when returning to this page. A later search,
+  // page change, or explicit reload still calls load normally.
+  const hydratedCache = useRef(false);
+  useEffect(() => {
+    if (!hydratedCache.current && cache?.recipes && cache.page === page && cache.search === search) {
+      hydratedCache.current = true;
+      setLoading(false);
+      return;
+    }
+    hydratedCache.current = true;
+    load(page, search);
+  }, [load, page, search]);
 
   useEffect(() => {
     let cancelled = false;
     (async () => {
       try {
-        const [foods, units] = await Promise.all([
+        const [foods, units, tags, categories] = await Promise.all([
           api.get("/foods?perPage=500"),
           api.get("/units?perPage=500"),
+          api.get("/organizers/tags?perPage=500"),
+          api.get("/organizers/categories?perPage=500"),
         ]);
         if (!cancelled) {
           setFoodOptions(foods.items || []);
           setUnitOptions(units.items || []);
+          setTagOptions(tags.items || []);
+          setCategoryOptions(categories.items || []);
         }
       } catch { /* autocomplete is optional; manual entry remains available */ }
     })();
@@ -714,6 +678,8 @@ function RecipesSection({ api, addLog, cache, onCache, parserEngine }) {
         recipeYield: editFull.recipeYield,
         orgURL: editFull.orgURL,
         rating: editFull.rating,
+        tags: (editFull.tags || []).map(taxonomyForSave),
+        recipeCategory: (editFull.recipeCategory || []).map(taxonomyForSave),
         recipeIngredient: ingredients.map(ingredientForSave),
         recipeInstructions: editFull.recipeInstructions,
         notes: editFull.notes,
@@ -733,14 +699,28 @@ function RecipesSection({ api, addLog, cache, onCache, parserEngine }) {
       i === idx ? { ...ingredient, ...changes, display: "" } : ingredient
     ),
   }));
+  const updateRecipeTaxonomy = (field, id, options) => {
+    if (!id) return;
+    setEditFull(current => {
+      const existing = current[field] || [];
+      if (existing.some(item => item.id === id)) return current;
+      const item = options.find(option => option.id === id);
+      return item ? { ...current, [field]: [...existing, taxonomyForSave(item)] } : current;
+    });
+  };
+  const removeRecipeTaxonomy = (field, id) => setEditFull(current => ({
+    ...current,
+    [field]: (current[field] || []).filter(item => item.id !== id),
+  }));
   const substitutionsText = (ingredient) => (ingredient.substitutions || [])
     .map(sub => sub.note || sub.substituteFood?.name || "")
     .filter(Boolean)
     .join(", ");
   const editedRelation = (current, value) => {
-    const name = value.trim();
+    const rawName = String(value);
+    const name = rawName.trim();
     if (!name) return null;
-    return { ...(current?.id && current.name === name ? { id: current.id } : {}), name };
+    return { ...(current?.id && current.name === rawName ? { id: current.id } : {}), name: rawName };
   };
   const relationFromOptions = (current, value, options) => {
     const exact = options.find(option => option.name?.trim().toLowerCase() === value.trim().toLowerCase());
@@ -891,9 +871,21 @@ function RecipesSection({ api, addLog, cache, onCache, parserEngine }) {
           let rows = (recipes || []);
           if (colFilters.name) rows = rows.filter(r => r.name.toLowerCase().includes(colFilters.name.toLowerCase()));
           if (colFilters.categories) rows = rows.filter(r => (r.recipeCategory || []).some(c => c.name.toLowerCase().includes(colFilters.categories.toLowerCase())));
+          const ingredientStatus = (r) => {
+            const ings = (r.recipeIngredient || []).filter(i => !i.title && ingredientInputText(i));
+            if (!ings.length) return "none";
+            const parsed = ings.filter(i => i.food).length;
+            return parsed === ings.length ? "parsed" : parsed === 0 ? "unparsed" : `${parsed}/${ings.length}`;
+          };
+          if (colFilters.ingredients) rows = rows.filter(r => {
+            const filter = colFilters.ingredients.toLowerCase();
+            return ingredientStatus(r).toLowerCase().includes(filter)
+              || (r.recipeIngredient || []).some(i => ingredientInputText(i).toLowerCase().includes(filter));
+          });
           rows = [...rows].sort((a, b) => {
             let av = a[tableSort.field] || "", bv = b[tableSort.field] || "";
             if (tableSort.field === "categories") { av = (a.recipeCategory || [])[0]?.name || ""; bv = (b.recipeCategory || [])[0]?.name || ""; }
+            if (tableSort.field === "ingredients") { av = ingredientStatus(a); bv = ingredientStatus(b); }
             if (tableSort.field === "dateAdded" || tableSort.field === "dateUpdated") {
               av = av ? new Date(av).getTime() : 0;
               bv = bv ? new Date(bv).getTime() : 0;
@@ -908,7 +900,9 @@ function RecipesSection({ api, addLog, cache, onCache, parserEngine }) {
               <tr>
                 <SortHeader label="Name" field="name" sort={tableSort} setSort={setTableSort} filter={colFilters.name} setFilter={v => setColFilters(f => ({ ...f, name: v }))} />
                 <SortHeader label="Categories" field="categories" sort={tableSort} setSort={setTableSort} filter={colFilters.categories} setFilter={v => setColFilters(f => ({ ...f, categories: v }))} filterPlaceholder="Filter by category…" />
-                <th>Ingredients</th>
+                <SortHeader label="Ingredients" field="ingredients" sort={tableSort} setSort={setTableSort}
+                  filter={colFilters.ingredients} setFilter={v => setColFilters(f => ({ ...f, ingredients: v }))}
+                  filterPlaceholder="Filter ingredient status…" />
                 <SortHeader label="Added" field="dateAdded" sort={tableSort} setSort={setTableSort} />
                 <SortHeader label="Modified" field="dateUpdated" sort={tableSort} setSort={setTableSort} />
                 <th>Actions</th>
@@ -1085,11 +1079,37 @@ function RecipesSection({ api, addLog, cache, onCache, parserEngine }) {
                   </div>
                 </div>
 
+                {/* Tags + Categories */}
+                <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12 }}>
+                  {[
+                    { field: "tags", label: "Tags", options: tagOptions, className: "tag-blue" },
+                    { field: "recipeCategory", label: "Categories", options: categoryOptions, className: "tag-orange" },
+                  ].map(({ field, label, options, className }) => (
+                    <div key={field}>
+                      <label style={{ fontSize: 11, color: C.muted, display: "block", marginBottom: 6 }}>{label}</label>
+                      <div style={{ display: "flex", flexWrap: "wrap", gap: 5, marginBottom: 6 }}>
+                        {(editFull[field] || []).map(item => (
+                          <span key={item.id} className={`tag ${className}`} style={{ display: "inline-flex", alignItems: "center", gap: 4 }}>
+                            {item.name}
+                            <button type="button" onClick={() => removeRecipeTaxonomy(field, item.id)}
+                              style={{ border: 0, background: "transparent", color: "inherit", cursor: "pointer", padding: 0, lineHeight: 1 }}>×</button>
+                          </span>
+                        ))}
+                      </div>
+                      <select value="" onChange={e => updateRecipeTaxonomy(field, e.target.value, options)}>
+                        <option value="">Add {field === "tags" ? "tag" : "category"}…</option>
+                        {options.filter(option => !(editFull[field] || []).some(item => item.id === option.id))
+                          .map(option => <option key={option.id} value={option.id}>{option.name}</option>)}
+                      </select>
+                    </div>
+                  ))}
+                </div>
+
                 {/* Ingredients */}
                 <div>
                   <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 8 }}>
                     <label style={{ fontSize: 11, color: C.muted, textTransform: "uppercase", letterSpacing: ".06em" }}>
-                      Ingredients ({(editFull.recipeIngredient || []).length})
+                      Ingredients ({(editFull.recipeIngredient || []).filter(isIngredientRow).length})
                     </label>
                     <div style={{ display: "flex", gap: 6 }}>
                       <button className="btn-ghost" style={{ fontSize: 11, padding: "3px 10px" }} onClick={() =>
@@ -1260,6 +1280,7 @@ function ParserSection({ api, addLog, parserEngine }) {
   const [mode, setMode] = useState("unparsed");
   const [reviewMode, setReviewMode] = useState(true); // show review step before saving
   const [running, setRunning] = useState(false);
+  const [tableSort, setTableSort] = useState({ field: "name", dir: "asc" });
   const [progress, setProgress] = useState({ done: 0, total: 0 });
   const [logs, setLogs] = useState([]);
   const [batchSize, setBatchSize] = useState(10);
@@ -2184,6 +2205,13 @@ function CookbooksSection({ api, addLog, cache, onCache, aiConfig }) {
     } catch { setCbRecipes([]); }
   };
 
+  const manageCookbook = (cb) => {
+    const included = new Set(cbRecipes.map(recipe => recipe.id));
+    setReviewing({ name: cb.name, description: cb.description || "", existingCb: cb });
+    setReviewRecipes(allRecipes.map(recipe => ({ recipe, included: included.has(recipe.id) })));
+    setReviewSearch("");
+  };
+
   const deleteCookbook = async (id, name) => {
     if (!confirm(`Delete cookbook "${name}"?`)) return;
     try {
@@ -2199,12 +2227,9 @@ function CookbooksSection({ api, addLog, cache, onCache, aiConfig }) {
     if (!name) return;
     setSaving(true);
     try {
-      await api.post("/households/cookbooks", {
-        name,
-        description: newDesc.trim(),
-        public: false,
-        queryFilterString: recipeIdFilter([]),
-      });
+      await api.post("/households/cookbooks", cookbookPayload({
+        name, description: newDesc.trim(), recipeIds: [],
+      }));
       addLog("ok", `Created: ${name}`);
       setNewName(""); setNewDesc(""); setCreating(false);
       load();
@@ -2271,20 +2296,19 @@ function CookbooksSection({ api, addLog, cache, onCache, aiConfig }) {
     const includedRecipes = reviewRecipes.filter(r => r.included).map(r => r.recipe);
     try {
       if (reviewing.existingCb) {
-        await api.put(`/households/cookbooks/${reviewing.existingCb.id}`, {
+        await api.put(`/households/cookbooks/${reviewing.existingCb.id}`, cookbookPayload({
           name: reviewing.existingCb.name,
           description: reviewing.existingCb.description || "",
-          public: reviewing.existingCb.public || false,
-          queryFilterString: recipeIdFilter(includedRecipes.map(recipe => recipe.id)),
-        });
+          public: reviewing.existingCb.public,
+          recipeIds: includedRecipes.map(recipe => recipe.id),
+        }));
         addLog("ok", `Updated cookbook "${reviewing.existingCb.name}" with ${includedRecipes.length} selected recipes`);
       } else {
-        await api.post("/households/cookbooks", {
+        await api.post("/households/cookbooks", cookbookPayload({
           name: reviewing.name,
           description: reviewing.description,
-          public: false,
-          queryFilterString: recipeIdFilter(includedRecipes.map(recipe => recipe.id)),
-        });
+          recipeIds: includedRecipes.map(recipe => recipe.id),
+        }));
         addLog("ok", `Created cookbook: ${reviewing.name} (${includedRecipes.length} recipes suggested)`);
       }
       setReviewing(null);
@@ -2475,6 +2499,8 @@ function CookbooksSection({ api, addLog, cache, onCache, aiConfig }) {
                 <span className={`tag ${selected.public ? "tag-green" : "tag-muted"}`}>
                   {selected.public ? "Public" : "Private"}
                 </span>
+                <button className="btn-primary" style={{ marginLeft: 10, padding: "6px 12px", fontSize: 12 }}
+                  onClick={() => manageCookbook(selected)}>Manage recipes</button>
               </div>
               <div style={{ fontWeight: 600 }}>Recipes ({cbRecipes.length})</div>
               {cbRecipes.length === 0 ? (
@@ -2960,10 +2986,15 @@ function BulkSection({ api, addLog, aiConfig }) {
   const [tags, setTags] = useState([]);
   const [categories, setCategories] = useState([]);
   const [cookbooks, setCookbooks] = useState([]);
+  const [cookbookMembership, setCookbookMembership] = useState({});
   const [assignTag, setAssignTag] = useState("");
   const [assignCat, setAssignCat] = useState("");
+  const [removeTag, setRemoveTag] = useState("");
+  const [removeCat, setRemoveCat] = useState("");
   const [assignCb, setAssignCb] = useState("");
   const [running, setRunning] = useState(false);
+  const [tableSort, setTableSort] = useState({ field: "name", dir: "asc" });
+  const [colFilters, setColFilters] = useState({ name: "", tags: "", categories: "" });
   // AI state
   const [aiOpen, setAiOpen] = useState(false);
   const [aiType, setAiType] = useState("tags"); // "tags" | "categories"
@@ -2981,7 +3012,8 @@ function BulkSection({ api, addLog, aiConfig }) {
         all = [...all, ...(d.items || [])];
         const totalPages = d.totalPages ?? d.total_pages;
         const total = d.total ?? d.total_count;
-        if (!(d.items || []).length || !(d.next || (totalPages && page < totalPages) || (total != null && all.length < total))) break;
+        const hasNextPage = totalPages ? page < totalPages : total != null ? all.length < total : (d.items || []).length === 100;
+        if (!(d.items || []).length || !hasNextPage) break;
         page++;
       }
       const [t, c, cb] = await Promise.all([
@@ -2993,14 +3025,43 @@ function BulkSection({ api, addLog, aiConfig }) {
       setTags(t.items || []);
       setCategories(c.items || []);
       setCookbooks(cb.items || []);
+      const membership = {};
+      await Promise.all((cb.items || []).map(async cookbook => {
+        try {
+          const result = await api.get(`/recipes?cookbook=${encodeURIComponent(cookbook.id)}&perPage=100`);
+          (result.items || []).forEach(recipe => {
+            membership[recipe.id] = [...(membership[recipe.id] || []), cookbook.name];
+          });
+        } catch { /* membership is supplemental; the bulk table still loads */ }
+      }));
+      setCookbookMembership(membership);
     } catch (e) { addLog("error", e.message); }
     setLoading(false);
   }, [api]);
 
   useEffect(() => { loadBulk(); }, [loadBulk]);
 
-  const filtered = recipes.filter(r => r.name.toLowerCase().includes(search.toLowerCase()));
+  const filtered = [...recipes].filter(r => {
+    const has = (field, value) => (r[field] || []).some(item => item.name?.toLowerCase().includes(value.toLowerCase()));
+    return r.name.toLowerCase().includes(search.toLowerCase())
+      && (!colFilters.name || r.name.toLowerCase().includes(colFilters.name.toLowerCase()))
+      && (!colFilters.tags || has("tags", colFilters.tags))
+      && (!colFilters.categories || has("recipeCategory", colFilters.categories));
+  }).sort((a, b) => {
+    const field = tableSort.field === "categories" ? "recipeCategory" : tableSort.field;
+    const av = field === "tags" || field === "recipeCategory"
+      ? (a[field] || []).map(item => item.name).join(", ")
+      : a[field] || "";
+    const bv = field === "tags" || field === "recipeCategory"
+      ? (b[field] || []).map(item => item.name).join(", ")
+      : b[field] || "";
+    const result = String(av).localeCompare(String(bv), undefined, { sensitivity: "base" });
+    return tableSort.dir === "asc" ? result : -result;
+  });
   const allSelected = filtered.length > 0 && filtered.every(r => selected.has(r.id));
+  const selectedRows = recipes.filter(r => selected.has(r.id));
+  const canRemoveTag = !!removeTag && selectedRows.some(r => (r.tags || []).some(t => t.id === removeTag));
+  const canRemoveCat = !!removeCat && selectedRows.some(r => (r.recipeCategory || []).some(c => c.id === removeCat));
 
   const toggleAll = () => {
     if (allSelected) setSelected(s => { const n = new Set(s); filtered.forEach(r => n.delete(r.id)); return n; });
@@ -3038,15 +3099,40 @@ function BulkSection({ api, addLog, aiConfig }) {
           }
         }
         addLog("ok", `Category "${cat?.name}" assigned to ${slugs.length} recipes`);
+      } else if (action === "removeTag" && removeTag) {
+        const tag = tags.find(t => t.id === removeTag);
+        for (const slug of slugs) {
+          const full = await api.get(`/recipes/${slug}`);
+          const nextTags = (full.tags || []).filter(item => item.id !== removeTag).map(taxonomyForSave);
+          if ((full.tags || []).some(item => item.id === removeTag)) {
+            await api.patch(`/recipes/${slug}`, { tags: nextTags });
+            localChanges.set(full.id, { tags: nextTags });
+          }
+        }
+        addLog("ok", `Tag "${tag?.name}" removed from ${slugs.length} recipes`);
+      } else if (action === "removeCat" && removeCat) {
+        const cat = categories.find(c => c.id === removeCat);
+        for (const slug of slugs) {
+          const full = await api.get(`/recipes/${slug}`);
+          const nextCategories = (full.recipeCategory || []).filter(item => item.id !== removeCat).map(taxonomyForSave);
+          if ((full.recipeCategory || []).some(item => item.id === removeCat)) {
+            await api.patch(`/recipes/${slug}`, { recipeCategory: nextCategories });
+            localChanges.set(full.id, { recipeCategory: nextCategories });
+          }
+        }
+        addLog("ok", `Category "${cat?.name}" removed from ${slugs.length} recipes`);
       } else if (action === "cookbook" && assignCb) {
         const cookbook = cookbooks.find(c => c.id === assignCb);
         if (!cookbook) throw new Error("Cookbook not found");
-        await api.put(`/households/cookbooks/${assignCb}`, {
+        const existingIds = Object.entries(cookbookMembership)
+          .filter(([, names]) => names.includes(cookbook.name))
+          .map(([id]) => id);
+        await api.put(`/households/cookbooks/${assignCb}`, cookbookPayload({
           name: cookbook.name,
           description: cookbook.description || "",
-          public: cookbook.public || false,
-          queryFilterString: recipeIdFilter(selectedRecipes.map(recipe => recipe.id)),
-        });
+          public: cookbook.public,
+          recipeIds: [...new Set([...existingIds, ...selectedRecipes.map(recipe => recipe.id)])],
+        }));
         addLog("ok", `Cookbook "${cookbook.name}" updated with ${selectedRecipes.length} selected recipes`);
       } else if (action === "delete") {
         if (!confirm(`Permanently delete ${selected.size} recipes?`)) { setRunning(false); return; }
@@ -3127,6 +3213,26 @@ function BulkSection({ api, addLog, aiConfig }) {
             <button className="btn-success" onClick={() => run("tag")} disabled={running || !assignTag || selected.size === 0}>
               Apply to {selected.size}
             </button>
+          </div>
+        </div>
+        <div style={{ display: "flex", flexDirection: "column", gap: 6, flex: 1, minWidth: 180 }}>
+          <label style={{ fontSize: 11, color: C.muted, textTransform: "uppercase", letterSpacing: ".06em" }}>Remove Tag</label>
+          <div style={{ display: "flex", gap: 8 }}>
+            <select value={removeTag} onChange={e => setRemoveTag(e.target.value)} style={{ flex: 1 }}>
+              <option value="">Select tag…</option>
+              {tags.map(t => <option key={t.id} value={t.id}>{t.name}</option>)}
+            </select>
+            <button className="btn-danger" onClick={() => run("removeTag")} disabled={running || !canRemoveTag}>Remove</button>
+          </div>
+        </div>
+        <div style={{ display: "flex", flexDirection: "column", gap: 6, flex: 1, minWidth: 180 }}>
+          <label style={{ fontSize: 11, color: C.muted, textTransform: "uppercase", letterSpacing: ".06em" }}>Remove Category</label>
+          <div style={{ display: "flex", gap: 8 }}>
+            <select value={removeCat} onChange={e => setRemoveCat(e.target.value)} style={{ flex: 1 }}>
+              <option value="">Select category…</option>
+              {categories.map(c => <option key={c.id} value={c.id}>{c.name}</option>)}
+            </select>
+            <button className="btn-danger" onClick={() => run("removeCat")} disabled={running || !canRemoveCat}>Remove</button>
           </div>
         </div>
         <div style={{ display: "flex", flexDirection: "column", gap: 6, flex: 1, minWidth: 180 }}>
@@ -3246,9 +3352,13 @@ function BulkSection({ api, addLog, aiConfig }) {
                 <th style={{ width: 40 }}>
                   <input type="checkbox" checked={allSelected} onChange={toggleAll} />
                 </th>
-                <th>Name</th>
-                <th>Tags</th>
-                <th>Categories</th>
+                <SortHeader label="Name" field="name" sort={tableSort} setSort={setTableSort}
+                  filter={colFilters.name} setFilter={value => setColFilters(filters => ({ ...filters, name: value }))} />
+                <SortHeader label="Tags" field="tags" sort={tableSort} setSort={setTableSort}
+                  filter={colFilters.tags} setFilter={value => setColFilters(filters => ({ ...filters, tags: value }))} />
+                <SortHeader label="Categories" field="categories" sort={tableSort} setSort={setTableSort}
+                  filter={colFilters.categories} setFilter={value => setColFilters(filters => ({ ...filters, categories: value }))} />
+                <th>Cookbooks</th>
               </tr>
             </thead>
             <tbody>
@@ -3262,6 +3372,7 @@ function BulkSection({ api, addLog, aiConfig }) {
                   <td style={{ fontWeight: 500 }}>{r.name}</td>
                   <td>{(r.tags || []).map(t => <span key={t.id} className="tag tag-blue" style={{ marginRight: 3 }}>{t.name}</span>)}</td>
                   <td>{(r.recipeCategory || []).map(c => <span key={c.id} className="tag tag-orange" style={{ marginRight: 3 }}>{c.name}</span>)}</td>
+                  <td>{(cookbookMembership[r.id] || []).map(name => <span key={name} className="tag tag-muted" style={{ marginRight: 3 }}>{name}</span>)}</td>
                 </tr>
               ))}
             </tbody>
@@ -3285,6 +3396,7 @@ function TaxonomySection({ api, addLog, cache, onCache, aiConfig }) {
   const [saving, setSaving] = useState(false);
   const [tableSort, setTableSort] = useState({ field: "name", dir: "asc" });
   const [nameFilter, setNameFilter] = useState("");
+  const [statusFilter, setStatusFilter] = useState("");
 
   // AI state — credentials come from global aiConfig (set in Admin → AI)
   const [aiOpen, setAiOpen] = useState(false);
@@ -3495,10 +3607,12 @@ function TaxonomySection({ api, addLog, cache, onCache, aiConfig }) {
       {/* List */}
       <div className="card" style={{ padding: 0, overflow: "hidden" }}>
         {loading ? <div style={{ padding: 40, textAlign: "center" }}><Spinner size={24} /></div> : (() => {
-          let rows = items.filter(i => !nameFilter || i.name.toLowerCase().includes(nameFilter.toLowerCase()));
+          let rows = items.filter(i => (!nameFilter || i.name.toLowerCase().includes(nameFilter.toLowerCase()))
+            && (!statusFilter || (statusFilter === "unused" ? !recipeCounts[i.id] : !!recipeCounts[i.id])));
           rows = [...rows].sort((a, b) => {
             let av, bv;
             if (tableSort.field === "recipes") { av = recipeCounts[a.id] || 0; bv = recipeCounts[b.id] || 0; return tableSort.dir === "asc" ? av - bv : bv - av; }
+            if (tableSort.field === "status") { av = recipeCounts[a.id] ? 1 : 0; bv = recipeCounts[b.id] ? 1 : 0; return tableSort.dir === "asc" ? av - bv : bv - av; }
             av = a.name || ""; bv = b.name || "";
             const cmp = av.localeCompare(bv);
             return tableSort.dir === "asc" ? cmp : -cmp;
@@ -3509,7 +3623,8 @@ function TaxonomySection({ api, addLog, cache, onCache, aiConfig }) {
               <tr>
                 <SortHeader label="Name" field="name" sort={tableSort} setSort={setTableSort} filter={nameFilter} setFilter={setNameFilter} />
                 <SortHeader label="Recipes" field="recipes" sort={tableSort} setSort={setTableSort} />
-                <th>Status</th>
+                <SortHeader label="Status" field="status" sort={tableSort} setSort={setTableSort}
+                  filter={statusFilter} setFilter={setStatusFilter} filterPlaceholder="in use or unused…" />
                 <th>Actions</th>
               </tr>
             </thead>
@@ -4537,18 +4652,11 @@ function ActivitySection({ api, addLog }) {
         let page = 1;
         while (true) {
           const d = await api.get(`/recipes?page=${page}&perPage=100`);
-          const items = (d.items || []).map(r => ({
-            ...r,
-            dateAdded: r.dateAdded ?? r.date_added,
-            dateUpdated: r.dateUpdated ?? r.date_updated,
-            lastMade: r.lastMade ?? r.last_made,
-            recipeCategory: r.recipeCategory ?? r.recipe_category,
-          }));
+          const items = (d.items || []).map(normalizeRecipe);
           all.push(...items);
           const total = d.total ?? d.total_count;
           const totalPages = d.totalPages ?? d.total_pages;
-          const hasNextPage = d.next || (totalPages && page < totalPages)
-            || (total != null && all.length < total);
+          const hasNextPage = totalPages ? page < totalPages : total != null ? all.length < total : items.length === 100;
           if (!items.length || !hasNextPage) break;
           page += 1;
         }
@@ -4587,6 +4695,20 @@ function ActivitySection({ api, addLog }) {
     return `${Math.floor(days / 30)} months ago`;
   };
 
+  const rows = [...recipes]
+    .filter(r => !nameFilter || (r.name || "").toLowerCase().includes(nameFilter.toLowerCase()))
+    .sort((a, b) => {
+      if (tableSort.field === "name") {
+        const cmp = (a.name || "").localeCompare(b.name || "", undefined, { sensitivity: "base" });
+        return tableSort.dir === "asc" ? cmp : -cmp;
+      }
+      const av = a[tableSort.field] ? Date.parse(a[tableSort.field]) : Number.NEGATIVE_INFINITY;
+      const bv = b[tableSort.field] ? Date.parse(b[tableSort.field]) : Number.NEGATIVE_INFINITY;
+      const safeAv = Number.isNaN(av) ? Number.NEGATIVE_INFINITY : av;
+      const safeBv = Number.isNaN(bv) ? Number.NEGATIVE_INFINITY : bv;
+      return tableSort.dir === "asc" ? safeAv - safeBv : safeBv - safeAv;
+    });
+
   return (
     <div style={{ display: "flex", flexDirection: "column", gap: 20 }}>
       <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
@@ -4602,23 +4724,9 @@ function ActivitySection({ api, addLog }) {
         ))}
       </div>
 
-      {loading ? <div style={{ textAlign: "center", padding: 60 }}><Spinner size={32} /></div> : (() => {
-        let rows = recipes.filter(r => !nameFilter || (r.name || "").toLowerCase().includes(nameFilter.toLowerCase()));
-        rows = [...rows].sort((a, b) => {
-          if (tableSort.field === "name") {
-            const cmp = (a.name || "").localeCompare(b.name || "", undefined, { sensitivity: "base" });
-            return tableSort.dir === "asc" ? cmp : -cmp;
-          }
-          const av = a[tableSort.field] ? Date.parse(a[tableSort.field]) : Number.NEGATIVE_INFINITY;
-          const bv = b[tableSort.field] ? Date.parse(b[tableSort.field]) : Number.NEGATIVE_INFINITY;
-          const safeAv = Number.isNaN(av) ? Number.NEGATIVE_INFINITY : av;
-          const safeBv = Number.isNaN(bv) ? Number.NEGATIVE_INFINITY : bv;
-          return tableSort.dir === "asc" ? safeAv - safeBv : safeBv - safeAv;
-        });
-        return (
-        <>
-        {error && <div className="card" style={{ color: C.red, padding: 16 }}>{error}</div>}
-        <div className="card" style={{ padding: 0, overflow: "hidden" }}>
+      {error && <div className="card" style={{ color: C.red, padding: 16 }}>{error}</div>}
+      <div className="card" style={{ padding: 0, overflow: "hidden" }}>
+        {loading ? <div style={{ textAlign: "center", padding: 60 }}><Spinner size={32} /></div> : (
           <table>
             <thead>
               <tr>
@@ -4654,10 +4762,9 @@ function ActivitySection({ api, addLog }) {
               ))}
             </tbody>
           </table>
-        </div>
-        </>
-      )}
-      )}
+        )}
       </div>
+      {!loading && !error && !rows.length && <div className="card" style={{ color: C.muted, padding: 16, textAlign: "center" }}>No recipes found.</div>}
+    </div>
   );
 }
