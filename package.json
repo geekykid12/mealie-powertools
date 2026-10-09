@@ -5,6 +5,7 @@
   "scripts": {
     "dev": "vite",
     "build": "vite build",
+    "test": "node --test server/utils.test.js server/proxy.test.js server/api-contract.test.js server/mealie-contract.test.js server/live-mealie.test.js src/apiAdapters.test.mjs",
     "preview": "vite preview"
   },
   "dependencies": {

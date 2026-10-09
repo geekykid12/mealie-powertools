@@ -1,8 +1,11 @@
 {
   "name": "mealie-powertools-server",
   "version": "1.0.0",
+  "scripts": {
+    "test": "node --test utils.test.js proxy.test.js api-contract.test.js mealie-contract.test.js live-mealie.test.js"
+  },
   "dependencies": {
     "express": "^4.19.2",
-    "http-proxy-middleware": "^3.0.3"
+    "http-proxy": "^1.18.1"
   }
 }

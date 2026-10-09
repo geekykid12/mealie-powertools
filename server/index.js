@@ -1,40 +1,76 @@
 const express = require("express");
-const { createProxyMiddleware, fixRequestBody } = require("http-proxy-middleware");
+const httpProxy = require("http-proxy");
 const path = require("path");
 const { Readable } = require("stream");
+const { normalizeHttpUrl, fetchWithTimeout, extractJsonArray } = require("./utils");
 
 const app = express();
+app.disable("x-powered-by");
 app.use(express.json({ limit: "10mb" }));
+
+app.use((req, res, next) => {
+  res.setHeader("X-Content-Type-Options", "nosniff");
+  res.setHeader("X-Frame-Options", "SAMEORIGIN");
+  res.setHeader("Referrer-Policy", "same-origin");
+  res.setHeader("Permissions-Policy", "camera=(), microphone=(), geolocation=()");
+  next();
+});
+
+const UPSTREAM_TIMEOUT_MS = Number(process.env.UPSTREAM_TIMEOUT_MS || 30000);
+// Local LLMs such as Ollama may spend minutes loading a model before replying.
+// Ollama may need several minutes to load a model and generate a response.
+const AI_UPSTREAM_TIMEOUT_MS = Number(process.env.AI_UPSTREAM_TIMEOUT_MS || 600000);
+const MEALIE_ALLOWED_HOSTS = process.env.MEALIE_ALLOWED_HOSTS || "";
+const AI_ALLOWED_HOSTS = process.env.AI_ALLOWED_HOSTS || "";
+
+function enforceAllowedHost(url, label, configuredHosts) {
+  if (!configuredHosts.trim()) return url;
+  const hostname = new URL(url).hostname.toLowerCase();
+  const allowed = configuredHosts.split(",").map(value => value.trim().toLowerCase()).filter(Boolean);
+  const matches = allowed.some(pattern => pattern === hostname
+    || (pattern.startsWith("*.") && hostname.endsWith(pattern.slice(1))));
+  if (!matches) throw new Error(`${label} host is not in the configured allowlist`);
+  return url;
+}
+
+function upstreamHeaders(token) {
+  return {
+    ...(token ? { Authorization: `Bearer ${token}` } : {}),
+    "Content-Type": "application/json",
+  };
+}
 
 // ── Proxy cache ────────────────────────────────────────────────────────────────
 const proxyCache = new Map();
 function getProxy(target) {
   if (!proxyCache.has(target)) {
-    proxyCache.set(target, createProxyMiddleware({
-      target,
-      changeOrigin: true,
-      on: {
-        // express.json() consumes the incoming request stream before the proxy
-        // sees it. Re-serialize req.body so POST/PATCH/PUT bodies reach Mealie.
-        proxyReq: fixRequestBody,
-        error: (err, req, res) => {
-          console.error(`[proxy error] ${err.message}`);
-          if (!res.headersSent) res.status(502).json({ error: `Proxy error: ${err.message}` });
-        },
-        proxyRes: (proxyRes, req) => {
-          console.log(`[proxy res] ${proxyRes.statusCode} ${req.method} ${req.url}`);
-        },
-      },
-    }));
+    const proxy = httpProxy.createProxyServer({ target, changeOrigin: true });
+    proxy.on("proxyReq", (proxyReq, req) => {
+      // express.json() consumes JSON request streams before the proxy sees
+      // them. Re-serialize parsed bodies so POST/PATCH/PUT reaches Mealie.
+      if (req.body === undefined) return;
+      const body = JSON.stringify(req.body);
+      proxyReq.setHeader("content-type", "application/json");
+      proxyReq.setHeader("content-length", Buffer.byteLength(body));
+      proxyReq.write(body);
+    });
+    proxy.on("proxyRes", (proxyRes, req) => {
+      console.log(`[proxy res] ${proxyRes.statusCode} ${req.method} ${req.url}`);
+    });
+    proxy.on("error", (err, req, res) => {
+      console.error(`[proxy error] ${err.message}`);
+      if (!res.headersSent) res.status(502).json({ error: `Proxy error: ${err.message}` });
+    });
+    proxyCache.set(target, (req, res) => proxy.web(req, res));
   }
   return proxyCache.get(target);
 }
 
 // ── Helper ─────────────────────────────────────────────────────────────────────
 async function mealieJson(url, token) {
-  const r = await fetch(url, {
-    headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
-  });
+  const safeUrl = normalizeHttpUrl(url, "Mealie URL");
+  enforceAllowedHost(safeUrl, "Mealie URL", MEALIE_ALLOWED_HOSTS);
+  const r = await fetchWithTimeout(safeUrl, { headers: upstreamHeaders(token) });
   if (!r.ok) throw new Error(`${r.status} ${r.statusText}`);
   const text = await r.text();
   if (text.trimStart().startsWith("<")) throw new Error(`Route not found: ${url}`);
@@ -43,6 +79,7 @@ async function mealieJson(url, token) {
 
 // ── Static frontend ────────────────────────────────────────────────────────────
 app.use(express.static(path.join(__dirname, "../dist")));
+app.get("/healthz", (req, res) => res.json({ status: "ok" }));
 
 // ── AI provider info ───────────────────────────────────────────────────────────
 // Returns whether AI is configured and the default provider's baseUrl + model
@@ -52,21 +89,23 @@ app.post("/ai-info", async (req, res) => {
   if (!mealieUrl || !token) return res.status(400).json({ error: "Missing params" });
 
   try {
+    const safeMealieUrl = normalizeHttpUrl(mealieUrl, "Mealie URL");
+    enforceAllowedHost(safeMealieUrl, "Mealie URL", MEALIE_ALLOWED_HOSTS);
     // 1. Get settings — tells us aiEnabled + defaultProviderId + groupId indirectly
-    const settings = await mealieJson(`${mealieUrl}/groups/ai-providers/settings`, token);
+    const settings = await mealieJson(`${safeMealieUrl}/groups/ai-providers/settings`, token);
     if (!settings.aiEnabled || !settings.defaultProviderId) {
       return res.json({ aiEnabled: false });
     }
 
     // 2. Get the user's group to find the groupId
-    const group = await mealieJson(`${mealieUrl}/groups/self`, token);
+    const group = await mealieJson(`${safeMealieUrl}/groups/self`, token);
     const groupId = group.id;
 
     // 3. Fetch the default provider's config via admin endpoint (no apiKey returned)
     let providerName = "", baseUrl = "", model = "";
     try {
       const provider = await mealieJson(
-        `${mealieUrl}/admin/groups/${groupId}/ai-providers/providers/${settings.defaultProviderId}`,
+        `${safeMealieUrl}/admin/groups/${groupId}/ai-providers/providers/${settings.defaultProviderId}`,
         token
       );
       providerName = provider.name || "";
@@ -88,31 +127,18 @@ app.post("/ai-info", async (req, res) => {
 
 // ── AI Cookbook endpoint ───────────────────────────────────────────────────────
 
-// Robustly extract a JSON array from an AI response that may include
-// surrounding text, markdown fences, or explanation before/after the JSON.
-function extractJsonArray(text) {
-  let s = text.replace(/```json\s*/gi, "").replace(/```/g, "").trim();
-  // Try direct parse
-  try { const r = JSON.parse(s); if (Array.isArray(r)) return r; } catch {}
-  // Find first [ and last ]
-  const start = s.indexOf("[");
-  const end   = s.lastIndexOf("]");
-  if (start !== -1 && end > start) {
-    try { const r = JSON.parse(s.slice(start, end + 1)); if (Array.isArray(r)) return r; } catch {}
-  }
-  // Regex scan for array
-  const match = s.match(/\[[\s\S]*\]/);
-  if (match) {
-    try { const r = JSON.parse(match[0]); if (Array.isArray(r)) return r; } catch {}
-  }
-  throw new Error("Could not extract JSON array from AI response. Raw: " + text.slice(0, 200));
-}
-
 app.post("/ai-cookbook", async (req, res) => {
   const { recipes, cookbooks, prompt, aiApiKey, aiBaseUrl, aiModel } = req.body;
   if (!aiApiKey) return res.status(400).json({ error: "Missing AI API key" });
+  if (!Array.isArray(recipes)) return res.status(400).json({ error: "recipes must be an array" });
+  if (cookbooks !== undefined && !Array.isArray(cookbooks)) return res.status(400).json({ error: "cookbooks must be an array" });
 
-  const baseUrl = (aiBaseUrl || "https://api.openai.com/v1").replace(/\/$/, "");
+  let baseUrl;
+  try {
+    baseUrl = normalizeHttpUrl(aiBaseUrl || "https://api.openai.com/v1", "AI base URL");
+    enforceAllowedHost(baseUrl, "AI base URL", AI_ALLOWED_HOSTS);
+  }
+  catch (e) { return res.status(400).json({ error: e.message }); }
   const model = aiModel || "gpt-4o-mini";
 
   try {
@@ -153,11 +179,11 @@ Remember: use only recipe names from my list above, and name the collections as 
     if (isGemini) body.response_format = { type: "json_object" };
 
     console.log("[ai-cookbook] calling", baseUrl, "model:", model);
-    const aiRes = await fetch(`${baseUrl}/chat/completions`, {
+    const aiRes = await fetchWithTimeout(`${baseUrl}/chat/completions`, {
       method: "POST",
       headers: { "Content-Type": "application/json", Authorization: `Bearer ${aiApiKey}` },
       body: JSON.stringify(body),
-    });
+    }, AI_UPSTREAM_TIMEOUT_MS);
 
     if (!aiRes.ok) {
       const err = await aiRes.text();
@@ -166,8 +192,6 @@ Remember: use only recipe names from my list above, and name the collections as 
 
     const aiData  = await aiRes.json();
     const rawText = aiData.choices?.[0]?.message?.content || "";
-    console.log("[ai-cookbook] raw response:", rawText.slice(0, 300));
-
     const suggestions = extractJsonArray(rawText);
     res.json({ suggestions, model });
   } catch (e) {
@@ -179,8 +203,16 @@ Remember: use only recipe names from my list above, and name the collections as 
 app.post("/ai-taxonomy", async (req, res) => {
   const { recipes, existingItems, type, prompt, aiApiKey, aiBaseUrl, aiModel } = req.body;
   if (!aiApiKey) return res.status(400).json({ error: "Missing AI API key" });
+  if (!Array.isArray(recipes)) return res.status(400).json({ error: "recipes must be an array" });
+  if (existingItems !== undefined && !Array.isArray(existingItems)) return res.status(400).json({ error: "existingItems must be an array" });
+  if (!['tags', 'categories'].includes(type)) return res.status(400).json({ error: "type must be tags or categories" });
 
-  const baseUrl = (aiBaseUrl || "https://api.openai.com/v1").replace(/\/$/, "");
+  let baseUrl;
+  try {
+    baseUrl = normalizeHttpUrl(aiBaseUrl || "https://api.openai.com/v1", "AI base URL");
+    enforceAllowedHost(baseUrl, "AI base URL", AI_ALLOWED_HOSTS);
+  }
+  catch (e) { return res.status(400).json({ error: e.message }); }
   const model = aiModel || "gpt-4o-mini";
 
   const isCategory = type === "categories";
@@ -227,11 +259,11 @@ Only include recipe names that actually exist in my list above.`;
     console.log("[ai-taxonomy] calling", baseUrl, "model:", model, "type:", type);
     let aiRes;
     try {
-      aiRes = await fetch(`${baseUrl}/chat/completions`, {
+      aiRes = await fetchWithTimeout(`${baseUrl}/chat/completions`, {
       method: "POST",
       headers: { "Content-Type": "application/json", Authorization: `Bearer ${aiApiKey}` },
       body: JSON.stringify(body),
-    });
+      }, AI_UPSTREAM_TIMEOUT_MS);
 
     } catch (fetchErr) {
       throw new Error(`fetch failed to reach ${baseUrl} — check network connectivity from the container: ${fetchErr.message}`);
@@ -244,8 +276,6 @@ Only include recipe names that actually exist in my list above.`;
 
     const aiData  = await aiRes.json();
     const rawText = aiData.choices?.[0]?.message?.content || "";
-    console.log("[ai-taxonomy] raw:", rawText.slice(0, 300));
-
     const suggestions = extractJsonArray(rawText);
     res.json({ suggestions, model });
   } catch (e) {
@@ -259,8 +289,13 @@ app.get("/img", async (req, res) => {
   const { src, mealie, token } = req.query;
   if (!src || !mealie) return res.status(400).send("Missing src or mealie param");
   try {
-    const url = `${decodeURIComponent(mealie)}/${src.replace(/^\//, "")}`;
-    const imgRes = await fetch(url, {
+    if (/^[a-z][a-z\d+.-]*:/i.test(src) || src.startsWith("//")) {
+      return res.status(400).send("Image source must be a relative Mealie path");
+    }
+    const baseUrl = normalizeHttpUrl(decodeURIComponent(mealie), "Mealie URL");
+    enforceAllowedHost(baseUrl, "Mealie URL", MEALIE_ALLOWED_HOSTS);
+    const url = new URL(src.replace(/^\//, ""), `${baseUrl}/`).toString();
+    const imgRes = await fetchWithTimeout(url, {
       headers: token ? { Authorization: `Bearer ${decodeURIComponent(token)}` } : {},
     });
     if (!imgRes.ok) return res.status(imgRes.status).send("Image fetch failed");
@@ -282,8 +317,13 @@ app.get("/img", async (req, res) => {
 app.use("/api", (req, res, next) => {
   const mealieUrl = req.headers["x-mealie-url"];
   if (!mealieUrl) return res.status(400).json({ error: "Missing X-Mealie-Url header" });
-  console.log(`[proxy] ${req.method} ${mealieUrl}${req.url}`);
-  getProxy(mealieUrl)(req, res, next);
+  let safeMealieUrl;
+  try { safeMealieUrl = normalizeHttpUrl(mealieUrl, "Mealie URL"); }
+  catch (e) { return res.status(400).json({ error: e.message }); }
+  try { enforceAllowedHost(safeMealieUrl, "Mealie URL", MEALIE_ALLOWED_HOSTS); }
+  catch (e) { return res.status(403).json({ error: e.message }); }
+  console.log(`[proxy] ${req.method} ${new URL(safeMealieUrl).host}${req.url}`);
+  getProxy(safeMealieUrl)(req, res, next);
 });
 
 // ── SPA fallback ───────────────────────────────────────────────────────────────
@@ -291,6 +331,10 @@ app.get("*", (req, res) => {
   res.sendFile(path.join(__dirname, "../dist/index.html"));
 });
 
-app.listen(3000, "0.0.0.0", () => {
-  console.log("Mealie PowerTools running on http://0.0.0.0:3000");
-});
+if (require.main === module) {
+  app.listen(3000, "0.0.0.0", () => {
+    console.log("Mealie PowerTools running on http://0.0.0.0:3000");
+  });
+}
+
+module.exports = { app };

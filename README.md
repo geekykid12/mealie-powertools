@@ -11,10 +11,10 @@ A self-hosted admin dashboard for your [Mealie](https://github.com/mealie-recipe
 |---|---|
 | **Dashboard** | Live stats, quick navigation |
 | **Recipes** | Search, full edit (ingredients, instructions, times, notes), delete, per-recipe ingredient parse |
-| **Ingredient Parser** | Bulk-parse unparsed or all recipes, with a review step to approve/reject each detected change before saving |
-| **Bulk Operations** | Select multiple recipes and bulk-assign tags, categories, or bulk-delete |
+| **Ingredient Parser** | Parse individual or multiple recipes with NLP, brute-force, or AI engines; review every recipe’s ingredient rows before saving, validate Foods and Units against Mealie, and create missing Foods or Units |
+| **Bulk Operations** | Select multiple recipes, filter by name/tags/categories, view cookbook membership, assign or remove tags/categories, add recipes to cookbooks, or bulk-delete |
 | **Tags & Categories** | Create, rename, delete — with usage counts and one-click "delete all unused" |
-| **Cookbooks** | Visualize, create, delete cookbooks and browse their recipes |
+| **Cookbooks** | Create, delete, browse, and manually manage cookbook recipes; review AI cookbook suggestions before saving |
 | **Data Quality** | Full audit: images, descriptions, ingredients, instructions, times, tags, parsed status, duplicates — with per-recipe and bulk auto-repair |
 | **Image Manager** | Find recipes missing images, set images by URL or file upload |
 | **Activity** | Recently added, modified, or cooked recipes |
@@ -28,6 +28,9 @@ A self-hosted admin dashboard for your [Mealie](https://github.com/mealie-recipe
 - Docker
 - A running [Mealie](https://github.com/mealie-recipes/mealie) instance (v3.x)
 - A Mealie API token (admin recommended for full access)
+
+PowerTools supports Mealie v3.x API responses and publishes Docker images for
+`linux/amd64` and `linux/arm64`.
 
 ---
 
@@ -77,6 +80,10 @@ docker compose -f docker-compose.attach.yml up -d
 
 PowerTools starts on port 3000. In the connection screen, use `http://mealie:9000/api` as the Mealie URL (internal hostname) or `http://<mealie-ip>:<port>/api` if you prefer the IP.
 
+The existing-Mealie compose file expects the Mealie container network to be
+attached externally. If your Mealie installation uses a different network name,
+replace `mealie_default` in the downloaded file before starting it.
+
 ---
 
 ### Option 3 — Docker Compose, fresh install (Mealie + PowerTools together)
@@ -95,6 +102,9 @@ an image refresh first, run `docker compose pull` before `docker compose up -d`.
 This starts both Mealie (port 9000) and PowerTools (port 3000). Default Mealie login: `changeme@example.com` / `MyPassword`.
 
 In the PowerTools connection screen, use `http://mealie:9000/api` as the Mealie URL.
+
+The bundled Mealie service uses the default development credentials shown above.
+Change them before using this setup for anything beyond local testing.
 
 ---
 
@@ -116,6 +126,12 @@ docker run -d --name mealie-powertools --restart unless-stopped -p 3000:3000 \
   ghcr.io/geekykid12/mealie-powertools:latest
 ```
 
+Versioned images are also available, for example:
+
+```bash
+docker pull ghcr.io/geekykid12/mealie-powertools:1.2.3
+```
+
 ---
 
 ## Connecting to Mealie
@@ -130,12 +146,37 @@ docker run -d --name mealie-powertools --restart unless-stopped -p 3000:3000 \
 
 > **How it works:** PowerTools runs a proxy server internally. Your browser talks to PowerTools on port 3000, and PowerTools forwards API calls to Mealie server-side. This means there are no CORS issues regardless of where each service is hosted, and you never need to expose the Mealie API port directly to your browser.
 
+After a successful connection, the Mealie URL and API token are saved in the
+browser so a page refresh can reconnect automatically. Use **Forget saved
+credentials** in the sidebar to remove them. Credentials are stored locally in
+the browser; use a browser profile you trust and avoid sharing its storage.
+
+## Parser and AI settings
+
+The parser engine is selected in **Admin** and applies to both individual and
+bulk parsing. The available engines are NLP, Brute Force, and AI. Parsed results
+are reviewed per recipe, with each ingredient shown as an editable row. Foods
+and Units are matched against Mealie’s existing data; missing relations can be
+created from the review screen before saving.
+
+AI-powered cookbook, tag, and category suggestions use the provider settings in
+**Admin**. Ollama and other slower providers are supported. The server-side AI
+request timeout defaults to 10 minutes and can be overridden when starting the
+container:
+
+```bash
+docker run -d --name mealie-powertools --restart unless-stopped \
+  -p 3000:3000 -e AI_UPSTREAM_TIMEOUT_MS=900000 \
+  ghcr.io/geekykid12/mealie-powertools:latest
+```
+
 ---
 
 ## Tested With
 
-- Mealie v3.27.0
-- Docker 24+ (AMD64 and ARM64 images are published)
+- Mealie v3.x (tested with v3.27.0)
+- Docker 24+
+- Docker images: Linux AMD64 and ARM64
 
 ---
 
